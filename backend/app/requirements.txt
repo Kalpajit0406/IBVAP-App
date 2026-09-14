@@ -1,0 +1,49 @@
+# Install PyTorch separately first:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+
+ultralytics==8.4.137   # pinned — YOLO26n, NMS-free head; bump deliberately, not via auto-upgrade
+supervision>=0.30.0    # new ByteTrack kwargs (track_activation_threshold, lost_track_buffer, frame_rate)
+opencv-python>=4.10.0
+pyyaml>=6.0
+numpy>=1.24.0
+
+# Web server mode (server.py)
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+websockets>=12.0            # feed_test.py / loadtest_mobile.py phone stand-ins
+qrcode>=7.4              # tunnel.py QR for the phone link (ASCII, no PIL needed)
+
+# Optional — ONVIF camera discovery (discover_cameras.py). WS-Discovery itself
+# is stdlib; this is only needed to auto-resolve each camera's RTSP URL:
+#   pip install onvif-zeep
+
+# Demo — screen-share detection overlay (screen_watch.py) AND `server.py --mode
+# screen` (src/screen_capture.py feeds the screen through the whole pipeline).
+# Fast screen capture; tkinter (overlay window) ships with Python on Windows.
+mss>=9.0
+
+# Dataset fetch (datasets_fetch.py). `gdown` pulls the Google Drive zips for the
+# weapon (YouTube-GDD) and night/thermal (LLVIP) sets; the script prints a manual
+# step if it's absent. `roboflow` / `kaggle` are OPTIONAL — only for adding the
+# FLIR ADAS thermal-vehicle set to a night fine-tune (datasets_fetch.py --thermal
+# --roboflow-key / --kaggle). Training itself uses ultralytics (pinned above).
+#   pip install gdown
+#   pip install roboflow      # optional, FLIR ADAS via Roboflow
+#   pip install kaggle        # optional, FLIR ADAS v2 via kaggle.json
+
+# ANPR — number-plate recognition (ibvap/anpr.py, anpr.enabled in config.yaml).
+# Two stages: a YOLO plate detector + a plate-text OCR. The OCR backend is
+# `fast_plate` (fast-plate-ocr — plate-specific ONNX model, no torch at runtime,
+# recommended) and falls back to EasyOCR (generic English) if it isn't installed.
+# If NEITHER is installed the ANPR engine disables itself and the rest of the
+# pipeline is unaffected.
+fast-plate-ocr[onnx-gpu]>=1.0     # OCR backend; use [onnx] on a CPU-only box
+easyocr>=1.7.0                    # OCR fallback
+# Training only (Kaggle notebook / training/train_anpr.py):
+#   pip install "fast-plate-ocr[train]"   kaggle   roboflow
+
+# TensorRT engine export (export_engine.py) — the pipeline default is
+# yolo26n.engine. GPU only. Pin to 10.x: 11.x removed the builder API
+# Ultralytics 8.4 uses. cu12 must match torch's cu126.
+#   pip install "tensorrt-cu12==10.13.3.9" onnx onnxslim
+# Then: python export_engine.py   (hardware-specific, re-run per GPU)

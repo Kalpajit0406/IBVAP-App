@@ -1,0 +1,24 @@
+[
+  {
+    "name": "thermal_20260909_211551",
+    "weights": "models/yolo26n_thermal_20260909_211551.pt",
+    "pose_weights": "yolo26n-pose.pt",
+    "created": 1788997400.6245441,
+    "label": "Thermal / night 20260909_211551",
+    "base_mAP": {
+      "mAP50": 0.6181,
+      "mAP50_95": 0.3645,
+      "precision": 0.713,
+      "recall": 0.5291
+    },
+    "ft_mAP": {
+      "mAP50": 0.8412,
+      "mAP50_95": 0.5248,
+      "precision": 0.861,
+      "recall": 0.7242
+    },
+    "delta": 0.1603,
+    "kind": "thermal",
+    "dataset": "LLVIP (+ FLIR ADAS)"
+  }
+]

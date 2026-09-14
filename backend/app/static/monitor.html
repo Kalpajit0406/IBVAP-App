@@ -1,0 +1,1096 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IBVAP — Command Monitor</title>
+<style>
+  :root {
+    --bg: #0c0e12; --surface: #13171f; --border: #1e2433;
+    --text: #e2e8f0; --muted: #64748b;
+    --green: #22c55e; --red: #ef4444; --orange: #f97316;
+    --font: 'Inter', system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font);
+         height: 100dvh; display: flex; flex-direction: column; overflow: hidden; }
+
+  header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 0 18px; height: 52px; flex-shrink: 0;
+    background: var(--surface); border-bottom: 1px solid var(--border);
+  }
+  .logo { font-size: 13px; font-weight: 700; letter-spacing: .12em; }
+  .logo span { color: var(--green); }
+  #conn-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  #conn-dot.live  { background: var(--green); box-shadow: 0 0 6px #22c55e66; }
+  #conn-dot.error { background: var(--red); }
+  #conn-label { font-size: 11px; color: var(--muted); }
+  .spacer { flex: 1; }
+
+  #stats { display: flex; gap: 15px; font-size: 11px; color: var(--muted);
+           font-variant-numeric: tabular-nums; margin-right: 14px; }
+  #stats .k { display: flex; flex-direction: column; line-height: 1.25; }
+  #stats .v { color: var(--text); font-weight: 600; font-size: 12px; }
+  #stats .lbl { font-size: 9px; letter-spacing: .06em; text-transform: uppercase; }
+  #stats .gpu .v { color: var(--green); }
+  #stats .save .v { color: var(--orange); }
+  #clock { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  #ms-buttons { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+  #model-switcher {
+    display: flex; align-items: center; gap: 4px; margin-right: 14px;
+    background: #181d27; padding: 3px 6px; border-radius: 20px;
+    border: 1px solid var(--border);
+  }
+  .ms-lbl { font-size: 9px; color: var(--muted); letter-spacing: .08em; text-transform: uppercase; font-weight: 700; margin-left: 4px; margin-right: 2px; }
+  .ms-btn {
+    font-size: 11px; font-weight: 700; padding: 3px 10px;
+    border-radius: 14px; border: 1px solid transparent;
+    background: transparent; color: var(--muted); cursor: pointer;
+    transition: all .15s ease;
+  }
+  .ms-btn:hover { color: var(--text); }
+  .ms-btn.active {
+    background: var(--green); color: #000;
+    box-shadow: 0 0 8px #22c55e44;
+  }
+  .ms-btn.switching {
+    background: var(--orange); color: #000;
+    animation: ms-pulse 1s infinite alternate;
+  }
+  @keyframes ms-pulse {
+    0% { opacity: 1; transform: scale(1); }
+    100% { opacity: 0.6; transform: scale(0.96); }
+  }
+
+  .body { display: flex; flex: 1; overflow: hidden; }
+
+  /* Single composited mosaic — one HTTP connection regardless of camera count */
+  #stage { flex: 1; position: relative; background: #05070a;
+           overflow: hidden; padding: 6px; }
+  #mosaic { position: absolute; inset: 6px; width: calc(100% - 12px);
+            height: calc(100% - 12px); object-fit: contain; display: block; }
+  #stage .empty { position: absolute; inset: 0; display: flex;
+                  flex-direction: column; align-items: center; justify-content: center;
+                  color: var(--muted); font-size: 13px; text-align: center;
+                  line-height: 1.9; }
+  [hidden] { display: none !important; }   /* author rules otherwise beat the attribute */
+  #stage .empty code { background: var(--surface); padding: 3px 8px;
+                       border-radius: 4px; color: var(--text); }
+
+  /* ── Layout bar (operator focus / grid) ──────────────────────────────── */
+  #layout-bar { position: absolute; z-index: 6; left: 12px; top: 12px;
+                display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+                background: #0e131caa; backdrop-filter: blur(4px);
+                border: 1px solid var(--border); border-radius: 20px; padding: 3px 5px; }
+  .lb-btn, .lb-cam { font-size: 10px; font-weight: 700; padding: 3px 9px;
+                     border-radius: 13px; border: 1px solid transparent;
+                     background: transparent; color: var(--muted); cursor: pointer;
+                     letter-spacing: .04em; }
+  .lb-btn:hover, .lb-cam:hover { color: var(--text); }
+  .lb-btn.active { background: var(--green); color: #000; }
+  #lb-cams { display: inline-flex; gap: 3px; flex-wrap: wrap;
+             padding-left: 5px; margin-left: 3px; border-left: 1px solid var(--border); }
+  .lb-cam { border-color: var(--border); font-variant-numeric: tabular-nums; }
+  .lb-cam.on { background: #38bdf8; color: #000; border-color: #38bdf8; }
+
+  #side { width: 320px; flex-shrink: 0; background: var(--surface);
+          border-left: 1px solid var(--border); display: flex;
+          flex-direction: column; overflow: hidden; }
+  .panel { display: flex; flex-direction: column; overflow: hidden; }
+  .panel + .panel { border-top: 1px solid var(--border); }
+  .panel h2 { font-size: 11px; font-weight: 600; letter-spacing: .08em;
+              color: var(--muted); padding: 13px 15px 9px;
+              display: flex; align-items: center; gap: 7px; flex-shrink: 0; }
+  .panel h2 .pill { margin-left: auto; font-size: 10px; font-weight: 700;
+                    color: var(--text); background: #ffffff12; border-radius: 20px;
+                    padding: 1px 8px; }
+
+  #dev-panel { flex: 0 0 auto; }
+  #dev-list { overflow-y: auto; }
+  .dev { padding: 7px 15px; border-top: 1px solid var(--border);
+         font-size: 11px; line-height: 1.5; }
+  .dev:first-child { border-top: 0; }
+  .dev .top { display: flex; align-items: center; gap: 7px; }
+  .dev .d { width: 8px; height: 8px; border-radius: 50%; background: var(--muted);
+            flex-shrink: 0; }
+  .dev.live    .d { background: var(--green); box-shadow: 0 0 5px #22c55e88; }
+  .dev.idle    .d { background: var(--orange); }
+  .dev.offline .d { background: var(--red); }
+  .dev .name { font-weight: 600; color: var(--text); overflow: hidden;
+               text-overflow: ellipsis; white-space: nowrap; }
+  .dev .lat { margin-left: auto; font-size: 9px; font-weight: 700;
+              font-variant-numeric: tabular-nums; padding: 1px 5px;
+              border-radius: 3px; }
+  .dev .lat.ok   { color: var(--green); background: #22c55e18; }
+  .dev .lat.warn { color: var(--orange); background: #f9731618; }
+  .dev .lat.bad  { color: #fff; background: var(--red); }
+  .dev .st { font-size: 9px; font-weight: 700;
+             letter-spacing: .05em; text-transform: uppercase; }
+  .dev.live    .st { color: var(--green); }
+  .dev.idle    .st { color: var(--orange); }
+  .dev.offline .st { color: var(--red); }
+  .dev .meta { color: var(--muted); font-variant-numeric: tabular-nums;
+               padding-left: 15px; }
+  .dev .meta b { color: #94a3b8; font-weight: 600; }
+  .dev .meta .knd { color: #38bdf8; text-transform: uppercase; font-size: 9px;
+                    font-weight: 700; letter-spacing: .04em; }
+  .empty-dev { padding: 20px 15px; color: var(--muted); font-size: 12px;
+               text-align: center; }
+
+  #log-panel { flex: 1; min-height: 90px; }
+  #log-list { flex: 1; overflow-y: auto; }
+  .log-item { padding: 9px 15px; border-top: 1px solid var(--border);
+              font-size: 11px; line-height: 1.5; }
+  .log-item .ll { font-weight: 700; }
+  .log-item .ll.Critical { color: var(--red); }
+  .log-item .ll.High     { color: var(--orange); }
+  .log-item .ll.Breach   { color: var(--red); }
+  .log-item .lm { color: var(--muted); margin-top: 2px; }
+  .log-item .snap-thumb { display: block; width: 100%; max-width: 258px;
+    margin-top: 5px; border: 1px solid var(--border); border-radius: 5px; }
+  .empty-log { padding: 22px 15px; color: var(--muted); font-size: 12px;
+               text-align: center; }
+
+  /* ── Virtual fences ─────────────────────────────────────────────────── */
+  #fence-panel { flex: 0 0 auto; max-height: 44%; }
+  .fc-ctl { padding: 4px 15px 10px; display: flex; flex-direction: column; gap: 6px; }
+  .fc-ctl select, .fc-ctl input {
+    background: #0f131b; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 7px; font-size: 11px; font-family: inherit; }
+  .fc-kind { display: flex; gap: 4px; }
+  .fc-kind .ms-btn { flex: 1; border: 1px solid var(--border); }
+  .fc-btns { display: flex; gap: 5px; flex-wrap: wrap; }
+  .fc-b { flex: 1; min-width: 62px; font-size: 11px; font-weight: 700;
+    padding: 5px 8px; border-radius: 6px; border: 1px solid var(--border);
+    background: #181d27; color: var(--text); cursor: pointer; }
+  .fc-b:hover { border-color: var(--green); }
+  .fc-b:disabled { opacity: .4; cursor: default; }
+  #fc-draw.armed { background: var(--orange); color: #000; border-color: var(--orange); }
+  .fc-hint { font-size: 9.5px; color: var(--muted); line-height: 1.5; }
+  #fc-list { overflow-y: auto; }
+  .fc-fence { display: flex; align-items: center; gap: 7px; padding: 6px 15px;
+    border-top: 1px solid var(--border); font-size: 11px; }
+  .fc-fence .fc-nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fc-fence .fc-nm b { color: #94a3b8; }
+  .fc-fence .fc-k { font-size: 9px; color: #38bdf8; text-transform: uppercase; font-weight: 700; }
+  .fc-fence .fc-x { cursor: pointer; color: var(--muted); font-weight: 700; padding: 0 3px; }
+  .fc-fence .fc-x:hover { color: var(--red); }
+  .fc-fence.hot { background: #ef444422; }
+  .empty-fc { padding: 16px 15px; color: var(--muted); font-size: 11.5px; text-align: center; }
+
+  #fence-svg { position: absolute; z-index: 5; overflow: visible; cursor: crosshair; }
+  #fence-svg .fpoly { fill: #22c55e1f; stroke: var(--green); stroke-width: 2.5; }
+  #fence-svg .fpoly.hot { fill: #ef444438; stroke: var(--red); }
+  #fence-svg .fline { fill: none; stroke: var(--green); stroke-width: 3.5; stroke-linecap: round; }
+  #fence-svg .fline.hot { stroke: var(--red); }
+  #fence-svg .fdraft { fill: #f9731622; stroke: var(--orange); stroke-width: 2.5; stroke-dasharray: 7 5; }
+  #fence-svg .fvert { fill: var(--orange); }
+  #fence-svg text { fill: #fff; font: 700 13px var(--font);
+    paint-order: stroke; stroke: #000; stroke-width: 3px; }
+
+  /* ── Learning panel ─────────────────────────────────────────────────── */
+  #learn-panel { flex: 0 0 auto; max-height: 46%; }
+  .lp-stats { font-size: 10px; color: var(--muted); line-height: 1.7;
+    font-variant-numeric: tabular-nums; }
+  .lp-stats b { color: #94a3b8; font-weight: 600; }
+  .lp-strip { display: flex; gap: 5px; overflow-x: auto; padding: 4px 0 2px; }
+  .lp-card { flex: 0 0 auto; width: 92px; }
+  .lp-card img { width: 92px; height: 60px; object-fit: cover; border-radius: 4px;
+    border: 1px solid var(--border); display: block; background: #05070a; }
+  .lp-card .lp-btns { display: flex; gap: 2px; margin-top: 2px; }
+  .lp-card .lp-btns button { flex: 1; font-size: 9px; font-weight: 700; padding: 2px 0;
+    border-radius: 3px; border: 1px solid var(--border); background: #181d27;
+    color: var(--muted); cursor: pointer; }
+  .lp-card .lp-btns .k:hover { color: var(--green); border-color: var(--green); }
+  .lp-card .lp-btns .d:hover { color: var(--red); border-color: var(--red); }
+  .lp-card .lp-btns .b:hover { color: #38bdf8; border-color: #38bdf8; }
+  .empty-lp { padding: 12px 0; color: var(--muted); font-size: 11px; text-align: center; }
+  .ms-badge { font-size: 8px; font-weight: 700; margin-left: 3px; padding: 0 3px;
+    border-radius: 6px; background: #22c55e33; color: var(--green); }
+  #stage .calib-grid { position: absolute; z-index: 4; pointer-events: none; }
+  #stage .calib-grid rect { fill: #ef444433; stroke: #ef444466; stroke-width: 0.5; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">IB<span>VAP</span></div>
+  <div id="conn-dot"></div>
+  <span id="conn-label">Connecting…</span>
+  <div class="spacer"></div>
+  <div id="model-switcher">
+    <span class="ms-lbl">MODEL</span>
+    <span id="ms-buttons"></span>
+  </div>
+  <div id="stats"></div>
+  <span id="clock"></span>
+</header>
+
+<div class="body">
+  <div id="stage">
+    <img id="mosaic" alt="camera mosaic" hidden>
+    <svg id="fence-svg" hidden></svg>
+    <div id="layout-bar" hidden>
+      <button id="lb-grid" class="lb-btn active">Grid</button>
+      <button id="lb-focus" class="lb-btn">Focus</button>
+      <span id="lb-cams" hidden></span>
+    </div>
+    <div class="empty" id="empty">
+      No cameras streaming yet.<br>
+      Replay footage: <code>python feed_test.py --cams 8</code><br>
+      or open <code>https://&lt;lan-ip&gt;:8443/camera/0</code> on a phone.
+    </div>
+  </div>
+  <aside id="side">
+    <section class="panel" id="dev-panel">
+      <h2>CONNECTED DEVICES <span class="pill" id="dev-count">0</span></h2>
+      <div id="dev-list"><p class="empty-dev">No devices connected.</p></div>
+    </section>
+    <section class="panel" id="log-panel">
+      <h2>ALERT LOG</h2>
+      <div id="log-list"><p class="empty-log">No alerts yet.</p></div>
+    </section>
+    <section class="panel" id="fence-panel">
+      <h2>VIRTUAL FENCES <span class="pill" id="fc-count">0</span></h2>
+      <div class="fc-ctl">
+        <select id="fc-cam"><option value="">— pick a camera —</option></select>
+        <div class="fc-kind">
+          <button class="ms-btn active" data-kind="polygon">Zone</button>
+          <button class="ms-btn" data-kind="line">Line</button>
+        </div>
+        <select id="fc-targets">
+          <option value="any">Any target</option>
+          <option value="person">Person only</option>
+          <option value="vehicle">Vehicle only</option>
+        </select>
+        <select id="fc-dir" hidden>
+          <option value="both">Cross either way</option>
+          <option value="a2b">Cross A&nbsp;&rarr;&nbsp;B</option>
+          <option value="b2a">Cross B&nbsp;&rarr;&nbsp;A</option>
+        </select>
+        <input id="fc-label" placeholder="label (optional)" maxlength="40">
+        <div class="fc-btns">
+          <button id="fc-draw" class="fc-b">Draw</button>
+          <button id="fc-undo" class="fc-b" disabled>Undo pt</button>
+          <button id="fc-save" class="fc-b" disabled>Save</button>
+          <button id="fc-cancel" class="fc-b" disabled>Cancel</button>
+          <button id="fc-clear" class="fc-b">Clear cam</button>
+        </div>
+        <div id="fc-hint" class="fc-hint">Pick a camera, choose Zone or Line,
+          hit <b>Draw</b>, then click on that camera's tile to place points.
+          A zone needs 3+ points; a line needs 2+ (each segment is a tripwire).
+          Click a fence's name below to <b>edit</b> its points.</div>
+      </div>
+      <div id="fc-list"><p class="empty-fc">No fences yet.</p></div>
+    </section>
+    <section class="panel" id="learn-panel">
+      <h2>LEARNING <span class="pill" id="lp-pending">0</span></h2>
+      <div class="fc-ctl">
+        <div id="lp-stats" class="lp-stats"></div>
+        <div id="lp-strip" class="lp-strip"></div>
+        <div class="fc-btns">
+          <button id="lp-dry" class="fc-b">Build set (dry-run)</button>
+          <button id="lp-train" class="fc-b">Retrain</button>
+        </div>
+        <div id="lp-train-state" class="fc-hint"></div>
+        <div class="fc-hint">Confirm the crops IBVAP is confident about, discard the
+          bad ones, mark empty frames <b>Bg</b>. Then <b>Retrain</b> fine-tunes a
+          new model you can switch to (and roll back). Calibration adjusts the
+          confidence floors live — no training.</div>
+      </div>
+    </section>
+  </aside>
+</div>
+
+<script>
+// Write guard (ibvap/security.py): /api/ writes from another machine need the
+// server's API token. Attach a remembered token, and on a 401 ask for it once
+// and retry, so a remote operator isn't left with silently failing buttons.
+(() => {
+  const nativeFetch = window.fetch.bind(window);
+  const KEY = 'ibvap_api_token';
+  const withToken = (init, tok) => {
+    const i = Object.assign({}, init || {});
+    const h = new Headers(i.headers || {});
+    if (tok) h.set('X-IBVAP-Token', tok);
+    i.headers = h;
+    return i;
+  };
+  window.fetch = async (input, init) => {
+    let tok = null;
+    try { tok = localStorage.getItem(KEY); } catch (_) {}
+    let res = await nativeFetch(input, withToken(init, tok));
+    if (res.status === 401) {
+      const entered = window.prompt('This action needs the IBVAP API token (data/api_token on the server):');
+      if (entered && entered.trim()) {
+        try { localStorage.setItem(KEY, entered.trim()); } catch (_) {}
+        res = await nativeFetch(input, withToken(init, entered.trim()));
+      }
+    }
+    return res;
+  };
+})();
+
+// Video: one composited MJPEG mosaic in a single <img> — N cameras, 1 connection.
+// Everything else (device list, risk badges, alerts) polls /status.
+const mosaic  = document.getElementById('mosaic');
+const stage   = document.getElementById('stage');
+const fenceSvg = document.getElementById('fence-svg');
+const emptyEl = document.getElementById('empty');
+const logList = document.getElementById('log-list');
+const devList = document.getElementById('dev-list');
+const devCount = document.getElementById('dev-count');
+const connDot = document.getElementById('conn-dot');
+const connLbl = document.getElementById('conn-label');
+const statsEl = document.getElementById('stats');
+const clock   = document.getElementById('clock');
+
+(function tick(){ clock.textContent = new Date().toLocaleTimeString(); setTimeout(tick, 1000); })();
+
+let mosaicStarted = false;
+const lastLevel = {};   // cam_id -> last risk level, for alert-log edges
+
+function startMosaic() {
+  if (!mosaicStarted) {
+    mosaicStarted = true;
+    mosaic.src = '/stream?' + Date.now();
+    mosaic.addEventListener('error', () => { mosaicStarted = false; }, { once: true });
+  }
+  // MJPEG streams don't fire 'load' reliably across browsers — reveal directly.
+  mosaic.hidden = false;
+  emptyEl.hidden = true;
+}
+
+function renderDevices(devs) {
+  devCount.textContent = devs.length;
+  if (!devs.length) {
+    devList.innerHTML = '<p class="empty-dev">No devices connected.</p>';
+    return;
+  }
+  devList.innerHTML = devs.map(d => {
+    const state = d.state || 'offline';
+    const cam = 'CAM-' + String(d.cam_id).padStart(2, '0');
+    const resized = d.resized ? ` · <b>resized</b> ${d.resized}` : '';
+    const lat = d.latency_ms || 0;
+    const latClass = lat >= 1500 ? 'lat bad' : lat >= 600 ? 'lat warn' : 'lat ok';
+    const latTxt = lat >= 1500 ? `${(lat / 1000).toFixed(1)}s DELAYED`
+                 : lat ? `${lat} ms` : '—';
+    const kind = d.kind && d.kind !== 'unknown' && d.kind !== 'mobile'
+               ? ` · <span class="knd">${d.kind}</span>` : '';
+    const rc = d.rtsp && d.rtsp.reconnects ? ` · <b>${d.rtsp.reconnects}</b> reconn` : '';
+    const err = d.rtsp && d.rtsp.last_error ? ` · <span class="lat bad">${d.rtsp.last_error}</span>` : '';
+    return `<div class="dev ${state}">
+      <div class="top">
+        <span class="d"></span>
+        <span class="name">${d.label || cam}</span>
+        <span class="${latClass}">${latTxt}</span>
+        <span class="st">${state}</span>
+      </div>
+      <div class="meta"><b>${cam}</b>${kind} · ${d.negotiated} ·
+        <b>${(d.delivered_fps || 0).toFixed(0)}</b> fps in ·
+        gate ${(d.gate_skip_pct || 0).toFixed(0)}% skip${resized}${rc}${err}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderStats(s) {
+  const p = s.pipeline || {};
+  const onGpu = s.device && s.device !== 'cpu';
+  statsEl.innerHTML = `
+    <div class="k gpu"><span class="v">${onGpu ? 'CUDA' : 'CPU'}</span><span class="lbl">device</span></div>
+    <div class="k"><span class="v">${(s.fps ?? 0).toFixed(0)}</span><span class="lbl">fps in</span></div>
+    <div class="k"><span class="v">${(p.mean_batch ?? 0).toFixed(1)}</span><span class="lbl">batch</span></div>
+    <div class="k"><span class="v">${(s.inference_ms ?? 0).toFixed(1)}</span><span class="lbl">ms/frame</span></div>
+    <div class="k save"><span class="v">${(p.gpu_saving_pct ?? 0).toFixed(0)}%</span><span class="lbl">gpu saved</span></div>
+    <div class="k"><span class="v">${s.frames_processed ?? 0}</span><span class="lbl">frames</span></div>` +
+    ((s.anpr && s.anpr.enabled)
+      ? `<div class="k"><span class="v" style="color:#f5c518">${s.anpr.plates_logged ?? 0}</span><span class="lbl">plates</span></div>`
+      : '');
+}
+
+function addLog(camId, meta) {
+  const empty = logList.querySelector('.empty-log');
+  if (empty) empty.remove();
+  const item = document.createElement('div');
+  item.className = 'log-item';
+  item.innerHTML = `
+    <div><b>CAM-${String(camId).padStart(2,'0')}</b>
+         &nbsp;<span class="ll ${meta.level}">${meta.level.toUpperCase()}</span></div>
+    <div class="lm">Score ${meta.score.toFixed(1)} · P:${meta.persons} V:${meta.vehicles}
+         · ${new Date().toLocaleTimeString()}</div>`;
+  logList.prepend(item);
+  const items = logList.querySelectorAll('.log-item');
+  if (items.length > 60) items[items.length - 1].remove();
+}
+
+function addPlateLog(camId, text, conf, valid) {
+  const empty = logList.querySelector('.empty-log');
+  if (empty) empty.remove();
+  const item = document.createElement('div');
+  item.className = 'log-item';
+  item.innerHTML = `
+    <div><b>CAM-${String(camId).padStart(2,'0')}</b>
+         &nbsp;<span class="ll" style="color:#f5c518">PLATE</span></div>
+    <div class="lm"><b style="color:#f5c518;letter-spacing:.06em">${text}</b>
+         ${(conf*100).toFixed(0)}%${valid ? '' : ' (unverified)'}
+         · ${new Date().toLocaleTimeString()}</div>`;
+  logList.prepend(item);
+  const items = logList.querySelectorAll('.log-item');
+  if (items.length > 60) items[items.length - 1].remove();
+}
+const seenPlates = new Set();
+
+function addFenceLog(camId, meta) {
+  const empty = logList.querySelector('.empty-log');
+  if (empty) empty.remove();
+  const item = document.createElement('div');
+  item.className = 'log-item';
+  item.innerHTML = `
+    <div><b>CAM-${String(camId).padStart(2,'0')}</b>
+         &nbsp;<span class="ll Breach">BREACH</span></div>
+    <div class="lm">${(meta.breach_zones || []).join(', ') || 'virtual fence'}
+         · ${new Date().toLocaleTimeString()}</div>`;
+  logList.prepend(item);
+  const items = logList.querySelectorAll('.log-item');
+  if (items.length > 60) items[items.length - 1].remove();
+}
+const lastBreach = {};   // cam_id -> was breaching last poll, for the alert-log edge
+
+// ── Virtual-fence drawing + overlay ─────────────────────────────────────────
+const FenceUI = {
+  fences: [],            // full list from GET /api/fences
+  active: {},            // {cam_id: {fence_id: bool}} from /status
+  labels: {},            // cam_id -> device label
+  ids: [], cols: 1,      // mosaic layout from /status
+  canvas: null,          // [w,h] of the composed mosaic, canvas px
+  tiles: {},             // cam_id -> {x,y,w,h} rect in canvas px (from /status.mosaic.tiles)
+  armed: false, kind: 'polygon', draftCam: null, draft: [], _editId: null,
+
+  el(id) { return document.getElementById(id); },
+  esc(s) { return String(s).replace(/[&<>"]/g,
+    c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); },
+
+  init() {
+    this.el('fc-cam').addEventListener('change', () => this.redraw());
+    this.el('fc-label').addEventListener('input', e => { this._label = e.target.value; });
+    this.el('fc-targets').addEventListener('change', e => { this._targets = e.target.value; });
+    this.el('fc-dir').addEventListener('change', e => { this._dir = e.target.value; });
+    document.querySelectorAll('.fc-kind .ms-btn').forEach(b => b.addEventListener('click', () => {
+      if (this.armed) return;
+      this.kind = b.dataset.kind;
+      document.querySelectorAll('.fc-kind .ms-btn').forEach(x => x.classList.toggle('active', x === b));
+      this.el('fc-dir').hidden = this.kind !== 'line';
+    }));
+    this.el('fc-draw').addEventListener('click', () => this.arm());
+    this.el('fc-undo').addEventListener('click', () => { this.draft.pop(); this._syncButtons(); this.redraw(); });
+    this.el('fc-save').addEventListener('click', () => this.save());
+    this.el('fc-cancel').addEventListener('click', () => this.cancel());
+    this.el('fc-clear').addEventListener('click', () => this.clearCam());
+    fenceSvg.addEventListener('click', e => this.onClick(e));
+    window.addEventListener('resize', () => this.redraw());
+    this.reload();
+  },
+
+  async reload() {
+    try {
+      const j = await (await fetch('/api/fences', { cache: 'no-store' })).json();
+      this.fences = j.fences || [];
+    } catch (e) { /* keep last */ }
+    this.renderList();
+    this.redraw();
+  },
+
+  onStatus(s) {
+    const m = s.mosaic || {};
+    this.ids = (m.ids || []).map(Number);
+    this.cols = m.cols || 1;
+    const TW = (m.tile && m.tile[0]) || 480, TH = (m.tile && m.tile[1]) || 270;
+    this.canvas = m.canvas ||
+      [this.cols * TW, (Math.ceil(this.ids.length / this.cols) || 1) * TH];
+    this.tiles = {};
+    (m.tiles || []).forEach(t => { this.tiles[Number(t.cam_id)] = t; });
+    if (!(m.tiles || []).length) {              // fallback: synth a uniform grid
+      this.ids.forEach((id, i) => {
+        this.tiles[id] = { cam_id: id, x: (i % this.cols) * TW,
+          y: Math.floor(i / this.cols) * TH, w: TW, h: TH };
+      });
+    }
+    const gf = s.geofence || {};
+    this.active = gf.active || {};
+    (s.devices || []).forEach(d => { this.labels[d.cam_id] = d.label || ('CAM-' + d.cam_id); });
+    this._syncCamOptions();
+    this.redraw();
+  },
+
+  _syncCamOptions() {
+    if (this.armed) return;                     // don't disturb an in-progress draw
+    const sel = this.el('fc-cam');
+    const want = this.ids.map(String);
+    const have = [...sel.options].slice(1).map(o => o.value);
+    if (want.join() === have.join()) return;
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">— pick a camera —</option>' +
+      this.ids.map(id => `<option value="${id}">CAM-${String(id).padStart(2,'0')} · ${this.labels[id] || ''}</option>`).join('');
+    if (want.includes(cur)) sel.value = cur;
+  },
+
+  // mosaic content-rect geometry (undo object-fit: contain). The composed image
+  // is canvas[0] x canvas[1]; per-camera rects come from /status.mosaic.tiles.
+  geom() {
+    if (!this.ids.length || !this.canvas) return null;
+    const Wimg = this.canvas[0], Himg = this.canvas[1];
+    const r = mosaic.getBoundingClientRect();
+    const st = stage.getBoundingClientRect();
+    const scale = Math.min(r.width / Wimg, r.height / Himg);
+    const cw = scale * Wimg, ch = scale * Himg;
+    const ox = (r.width - cw) / 2, oy = (r.height - ch) / 2;
+    return { Wimg, Himg, scale, cw, ch, ox, oy, r,
+             left: (r.left - st.left) + ox, top: (r.top - st.top) + oy };
+  },
+
+  tileAt(clientX, clientY) {
+    const g = this.geom(); if (!g) return null;
+    const px = clientX - g.r.left - g.ox, py = clientY - g.r.top - g.oy;
+    if (px < 0 || py < 0 || px > g.cw || py > g.ch) return null;
+    const ix = px / g.scale, iy = py / g.scale;      // canvas px
+    for (const id of this.ids) {
+      const t = this.tiles[id]; if (!t) continue;
+      if (ix >= t.x && ix < t.x + t.w && iy >= t.y && iy < t.y + t.h)
+        return { camId: id, u: (ix - t.x) / t.w, v: (iy - t.y) / t.h };
+    }
+    return null;
+  },
+
+  // camera + normalised (u,v) -> svg viewBox (canvas) coords
+  xy(camId, u, v) {
+    const t = this.tiles[Number(camId)];
+    if (!t) return null;
+    return [t.x + u * t.w, t.y + v * t.h];
+  },
+
+  // one small arrow per segment, along the normal, toward the side a target
+  // ends up on for an "a2b" crossing (matches server._draw_fences)
+  _dirArrows(pj, direction, colour) {
+    const sign = direction === 'a2b' ? 1 : -1;
+    let s = '';
+    for (let i = 0; i < pj.length - 1; i++) {
+      const [ax, ay] = pj[i], [bx, by] = pj[i + 1];
+      const mx = (ax + bx) / 2, my = (ay + by) / 2;
+      const dx = bx - ax, dy = by - ay;
+      const n = Math.hypot(dx, dy) || 1;
+      const px = (dy / n) * sign, py = (-dx / n) * sign;
+      const tx = mx + px * 16, ty = my + py * 16;
+      const w = 5;
+      s += `<path d="M${mx},${my} L${tx},${ty} M${tx},${ty} `
+        + `l${-px * w - py * w},${-py * w + px * w} M${tx},${ty} `
+        + `l${-px * w + py * w},${-py * w - px * w}" `
+        + `stroke="${colour}" stroke-width="2" fill="none"/>`;
+    }
+    return s;
+  },
+
+  onClick(e) {
+    const hit = this.tileAt(e.clientX, e.clientY);
+    if (!hit) return;
+    if (!this.armed) { this.el('fc-cam').value = String(hit.camId); this.redraw(); return; }
+    if (hit.camId !== this.draftCam) return;                 // only the armed camera
+    this.draft.push({ u: hit.u, v: hit.v });
+    this._syncButtons();
+    this.redraw();
+  },
+
+  arm() {
+    const cam = this.el('fc-cam').value;
+    if (cam === '') { this.el('fc-hint').textContent = 'Choose a camera first.'; return; }
+    this.armed = true; this.draftCam = Number(cam); this.draft = []; this._editId = null;
+    this.el('fc-draw').classList.add('armed');
+    this.el('fc-draw').disabled = true;
+    this.el('fc-cancel').disabled = false;
+    this.el('fc-hint').textContent = 'Click points on CAM-' +
+      String(this.draftCam).padStart(2, '0') + '. ' +
+      (this.kind === 'line' ? 'Two or more — trace the fence line, then Save.'
+                            : 'Three or more, then Save.');
+    this._syncButtons(); this.redraw();
+  },
+
+  _syncButtons() {
+    const n = this.draft.length;
+    const ok = this.kind === 'line' ? n >= 2 : n >= 3;
+    this.el('fc-undo').disabled = !this.armed || n === 0;
+    this.el('fc-save').disabled = !this.armed || !ok;
+  },
+
+  cancel() {
+    this.armed = false; this.draft = []; this.draftCam = null; this._editId = null;
+    this.el('fc-draw').classList.remove('armed');
+    this.el('fc-draw').disabled = false;
+    this.el('fc-undo').disabled = true;
+    this.el('fc-save').disabled = true;
+    this.el('fc-cancel').disabled = true;
+    this.el('fc-hint').textContent =
+      "Pick a camera, choose Zone or Line, hit Draw, then click on that camera's tile.";
+    this._syncCamOptions();     // catch up any camera changes deferred during the draw
+    this.redraw();
+  },
+
+  // Load an existing fence's points back into the draft so it can be reshaped
+  // and re-saved (replaces it by id).
+  edit(id) {
+    if (this.armed) return;
+    const f = this.fences.find(x => x.id === id);
+    if (!f) return;
+    this.kind = f.kind;
+    document.querySelectorAll('.fc-kind .ms-btn').forEach(x =>
+      x.classList.toggle('active', x.dataset.kind === f.kind));
+    this.el('fc-dir').hidden = f.kind !== 'line';
+    this._dir = f.direction || 'both'; this.el('fc-dir').value = this._dir;
+    this._targets = (f.targets && f.targets[0]) || 'any';
+    this.el('fc-targets').value = this._targets;
+    this._label = f.label || ''; this.el('fc-label').value = this._label;
+    this.el('fc-cam').value = String(f.cam_id);
+    this.armed = true; this.draftCam = Number(f.cam_id); this._editId = id;
+    this.draft = (f.points || []).map(([u, v]) => ({ u, v }));
+    this.el('fc-draw').classList.add('armed');
+    this.el('fc-draw').disabled = true;
+    this.el('fc-cancel').disabled = false;
+    this.el('fc-hint').textContent = 'Editing ' + (f.label || id) +
+      ' — click to add points, Undo pt to trim, then Save.';
+    this._syncButtons(); this.redraw();
+  },
+
+  async clearCam() {
+    const cam = this.el('fc-cam').value;
+    if (cam === '') { alert('Pick a camera first.'); return; }
+    const mine = this.fences.filter(f => String(f.cam_id) === String(cam));
+    if (!mine.length) { alert('No fences on CAM-' + String(cam).padStart(2, '0') + '.'); return; }
+    if (!confirm('Remove all ' + mine.length + ' fence(s) on CAM-' +
+                 String(cam).padStart(2, '0') + '?')) return;
+    const all = this.fences.filter(f => String(f.cam_id) !== String(cam));
+    try {
+      await fetch('/api/fences', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fences: all }),
+      });
+    } catch (e) { /* ignore */ }
+    await this.reload();
+  },
+
+  async save() {
+    const pts = this.draft.map(p => [Math.round(p.u * 1e5) / 1e5, Math.round(p.v * 1e5) / 1e5]);
+    const need = this.kind === 'line' ? 2 : 3;
+    if (pts.length < need) { alert(`Need at least ${need} points.`); return; }
+    const fence = {
+      cam_id: this.draftCam, kind: this.kind, points: pts,
+      direction: this.kind === 'line' ? (this._dir || 'both') : 'both',
+      targets: [this._targets || 'any'],
+      label: (this._label || '').trim(), enabled: true,
+    };
+    const all = this._editId
+      ? this.fences.map(f => f.id === this._editId ? { ...f, ...fence } : f)
+      : this.fences.concat([fence]);
+    try {
+      const res = await fetch('/api/fences', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fences: all }),
+      });
+      if (!res.ok) { const j = await res.json(); alert('Rejected: ' + (j.errors || []).join('; ')); return; }
+      this.el('fc-label').value = ''; this._label = '';
+      this.cancel();
+      await this.reload();
+    } catch (e) { alert('Save failed: ' + e); }
+  },
+
+  async del(id) {
+    if (!confirm('Delete this fence?')) return;
+    try { await fetch('/api/fences/' + encodeURIComponent(id), { method: 'DELETE' }); }
+    catch (e) { /* ignore */ }
+    await this.reload();
+  },
+
+  async toggle(id, enabled) {
+    const all = this.fences.map(f => f.id === id ? { ...f, enabled } : f);
+    try {
+      await fetch('/api/fences', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fences: all }),
+      });
+    } catch (e) { /* ignore */ }
+    await this.reload();
+  },
+
+  renderList() {
+    const box = this.el('fc-list');
+    this.el('fc-count').textContent = this.fences.length;
+    if (!this.fences.length) { box.innerHTML = '<p class="empty-fc">No fences yet.</p>'; return; }
+    box.innerHTML = this.fences.map(f => {
+      const hot = (this.active[f.cam_id] || {})[f.id];
+      const cam = 'CAM-' + String(f.cam_id).padStart(2, '0');
+      const npts = (f.points || []).length;
+      const kindTxt = f.kind === 'line'
+        ? (npts > 2 ? 'line · ' + (npts - 1) + ' seg' : 'line') : 'zone';
+      return `<div class="fc-fence ${hot ? 'hot' : ''}">
+        <input type="checkbox" ${f.enabled === false ? '' : 'checked'}
+               onchange="FenceUI.toggle('${f.id}', this.checked)">
+        <span class="fc-nm" title="click to edit points" style="cursor:pointer"
+              onclick="FenceUI.edit('${f.id}')"><b>${cam}</b> ${f.label ? '· ' + this.esc(f.label) : ''}
+          <span class="fc-k">${kindTxt}</span></span>
+        <span class="fc-x" title="delete" onclick="FenceUI.del('${f.id}')">&times;</span>
+      </div>`;
+    }).join('');
+  },
+
+  redraw() {
+    const g = this.geom();
+    // NB: SVGElement has no reflecting .hidden property — toggle the attribute.
+    if (!g || !this.ids.length) { fenceSvg.setAttribute('hidden', ''); return; }
+    fenceSvg.removeAttribute('hidden');
+    fenceSvg.style.left = g.left + 'px';
+    fenceSvg.style.top = g.top + 'px';
+    fenceSvg.style.width = g.cw + 'px';
+    fenceSvg.style.height = g.ch + 'px';
+    fenceSvg.setAttribute('viewBox', `0 0 ${g.Wimg} ${g.Himg}`);
+    // Only intercept clicks while actually drawing, so normal viewing isn't hijacked.
+    fenceSvg.style.pointerEvents = this.armed ? 'auto' : 'none';
+
+    let out = '';
+    for (const f of this.fences) {                 // draw every fence, always
+      if (f.enabled === false) continue;
+      const pj = f.points.map(([u, v]) => this.xy(f.cam_id, u, v)).filter(Boolean);
+      if (pj.length < 2) continue;
+      const hot = (this.active[f.cam_id] || {})[f.id] ? ' hot' : '';
+      const d = pj.map(p => p.join(',')).join(' ');
+      out += f.kind === 'line'
+        ? `<polyline class="fline${hot}" points="${d}"/>`
+        : `<polygon class="fpoly${hot}" points="${d}"/>`;
+      if (f.kind === 'line' && f.direction && f.direction !== 'both') {
+        out += this._dirArrows(pj, f.direction, hot ? 'var(--red)' : 'var(--green)');
+      }
+      const [lx, ly] = pj[0];
+      out += `<text x="${lx + 4}" y="${ly - 6}">${this.esc(f.label || f.id)}</text>`;
+    }
+    if (this.armed && this.draft.length) {
+      const pj = this.draft.map(p => this.xy(this.draftCam, p.u, p.v)).filter(Boolean);
+      if (pj.length) {
+        const d = pj.map(p => p.join(',')).join(' ');
+        out += this.kind === 'line'
+          ? `<polyline class="fdraft" points="${d}"/>`
+          : `<polygon class="fdraft" points="${d}"/>`;
+        for (const [x, y] of pj) out += `<circle class="fvert" cx="${x}" cy="${y}" r="5"/>`;
+      }
+    }
+    fenceSvg.innerHTML = out;
+  },
+};
+
+// ── Operator layout: Grid ⇄ Focus (1-4 mains + right-side filmstrip) ────────
+// The mosaic is one shared server-composited JPEG, so the layout is global —
+// POST /api/layout and the next /stream frame + /status poll pick it up.
+const LayoutUI = {
+  mode: 'grid', mains: [], ids: [],
+  el(id) { return document.getElementById(id); },
+
+  init() {
+    try {
+      const sv = JSON.parse(localStorage.getItem('ibvap.layout') || '{}');
+      if (sv.mode === 'focus' || sv.mode === 'grid') this.mode = sv.mode;
+      if (Array.isArray(sv.mains)) this.mains = sv.mains.map(Number);
+    } catch (e) { /* ignore */ }
+    this.el('lb-grid').addEventListener('click', () => this.set('grid'));
+    this.el('lb-focus').addEventListener('click', () => this.set('focus'));
+    if (this.mode === 'focus') this.push();      // restore server-side on load
+    this.render();
+  },
+
+  onStatus(s) {
+    const m = s.mosaic || {};
+    this.ids = (m.ids || []).map(Number);
+    this.el('layout-bar').hidden = !this.ids.length;
+    // reconcile if another operator changed the shared layout
+    if (m.mode && (m.mode !== this.mode ||
+        (m.mode === 'focus' && (m.mains || []).join() !== this.mains.join()))) {
+      this.mode = m.mode;
+      this.mains = (m.mains || []).map(Number);
+      this.save();
+    }
+    this.render();
+  },
+
+  set(mode) {
+    this.mode = mode;
+    if (mode === 'grid') this.mains = [];
+    if (mode === 'focus' && !this.mains.length && this.ids.length)
+      this.mains = this.ids.slice(0, Math.min(4, this.ids.length));
+    this.save(); this.push(); this.render();
+  },
+
+  toggleCam(id) {
+    id = Number(id);
+    const i = this.mains.indexOf(id);
+    if (i >= 0) this.mains.splice(i, 1);
+    else if (this.mains.length < 4) this.mains.push(id);
+    this.save(); this.push(); this.render();
+  },
+
+  save() {
+    try {
+      localStorage.setItem('ibvap.layout',
+        JSON.stringify({ mode: this.mode, mains: this.mains }));
+    } catch (e) { /* ignore */ }
+  },
+
+  async push() {
+    try {
+      await fetch('/api/layout', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: this.mode, mains: this.mains }),
+      });
+    } catch (e) { /* ignore */ }
+  },
+
+  render() {
+    this.el('lb-grid').classList.toggle('active', this.mode === 'grid');
+    this.el('lb-focus').classList.toggle('active', this.mode === 'focus');
+    const box = this.el('lb-cams');
+    box.hidden = this.mode !== 'focus';
+    if (this.mode !== 'focus') return;
+    box.innerHTML = this.ids.map(id =>
+      `<button class="lb-cam ${this.mains.includes(id) ? 'on' : ''}"
+        onclick="LayoutUI.toggleCam(${id})">CAM-${String(id).padStart(2, '0')}</button>`).join('')
+      || '<span class="fc-hint">no cameras</span>';
+  },
+};
+
+// ── Intrusion snapshots → ALERT LOG thumbnails ─────────────────────────────
+const SnapUI = {
+  seen: new Set(),
+  tag: { breach: 'BREACH', weapon: 'WEAPON', posture: 'POSTURE' },
+
+  async tick() {
+    try {
+      const j = await (await fetch('/api/snapshots?limit=16', { cache: 'no-store' })).json();
+      // oldest → newest so prepend keeps chronological order in the log
+      for (const r of (j.snapshots || []).slice().reverse()) {
+        const key = r.cam_id + '|' + r.ts + '|' + r.reason;
+        if (this.seen.has(key)) continue;
+        this.seen.add(key);
+        this.add(r);
+      }
+      if (this.seen.size > 400) this.seen.clear();
+    } catch (e) { /* ignore */ }
+    setTimeout(() => this.tick(), 2000);
+  },
+
+  add(r) {
+    const empty = logList.querySelector('.empty-log');
+    if (empty) empty.remove();
+    const cam = 'CAM-' + String(r.cam_id).padStart(2, '0');
+    const tag = this.tag[r.reason] || String(r.reason).toUpperCase();
+    const cls = r.reason === 'posture' ? 'High' : 'Breach';
+    const href = r.file ? '/snap/' + r.file : (r.raw_file ? '/snap/' + r.raw_file : '');
+    const detail = r.detail ? ' · ' + FenceUI.esc(r.detail) : '';
+    const item = document.createElement('div');
+    item.className = 'log-item';
+    item.innerHTML =
+      `<div><b>${cam}</b> &nbsp;<span class="ll ${cls}">${tag}</span>${detail}</div>` +
+      (href ? `<a href="${href}" target="_blank" rel="noopener">
+                 <img class="snap-thumb" src="${href}" alt="${tag} snapshot" loading="lazy"></a>` : '') +
+      `<div class="lm">${new Date((r.ts || 0) * 1000).toLocaleTimeString()}</div>`;
+    logList.prepend(item);
+    const items = logList.querySelectorAll('.log-item');
+    if (items.length > 60) items[items.length - 1].remove();
+  },
+};
+
+// ── Continuous-learning panel ──────────────────────────────────────────────
+const LearnUI = {
+  pool: [], calib: {}, lastTrain: {}, _stat: {}, _lastPending: -1,
+  el(id) { return document.getElementById(id); },
+
+  init() {
+    this.el('lp-dry').addEventListener('click', () => this.retrain(true));
+    this.el('lp-train').addEventListener('click', () => this.retrain(false));
+    this.reload();
+  },
+
+  async reload() {
+    try {
+      const j = await (await fetch('/api/learn/pool?status=pending', { cache: 'no-store' })).json();
+      this.pool = (j.items || []).slice(0, 24);
+    } catch (e) { /* keep */ }
+    this.render();
+  },
+
+  onStatus(s) {
+    const L = s.learning || {};
+    this._stat = L;
+    this.calib = (L.calibration || {}).cams || {};
+    this.lastTrain = L.last_train || {};
+    this.el('lp-pending').textContent = L.pool_pending ?? 0;
+    this.renderStats();
+    this.renderTrainState();
+    if (this._lastPending !== L.pool_pending) { this._lastPending = L.pool_pending; this.reload(); }
+  },
+
+  renderStats() {
+    const L = this._stat;
+    const deltas = Object.entries(this.calib).map(([c, d]) =>
+      `CAM-${String(c).padStart(2, '0')} <b>${d.person_delta >= 0 ? '+' : ''}${d.person_delta.toFixed(2)}</b>`
+      + (d.suppress_cells && d.suppress_cells.length ? ` ${d.suppress_cells.length}■` : '')
+      + (d.applied ? '' : ' (learning)')).join('  ·  ');
+    this.el('lp-stats').innerHTML =
+      `harvested <b>${L.harvested_total ?? 0}</b> · pending <b>${L.pool_pending ?? 0}</b>`
+      + ` · kept <b>${L.pool_kept ?? 0}</b> · dropped <b>${L.pool_dropped ?? 0}</b>`
+      + ` · ${L.rate_per_min ?? 0}/min`
+      + (deltas ? `<br>calib: ${deltas}` : '');
+  },
+
+  renderTrainState() {
+    const t = this.lastTrain;
+    let msg = '';
+    if (t.state === 'running') msg = `training (${t.mode})…  ${(t.log_tail || []).slice(-1)[0] || ''}`;
+    else if (t.state === 'done' && t.delta != null)
+      msg = `last: ${t.name || t.mode}  Δ ${t.delta >= 0 ? '+' : ''}${(t.delta * 100).toFixed(1)} mAP — switch from the MODEL row`;
+    else if (t.state === 'done') msg = `last: ${t.mode} done`;
+    else if (t.state === 'failed') msg = `last: ${t.mode} failed (${t.reason || t.error || '?'})`;
+    this.el('lp-train-state').textContent = msg;
+    this.el('lp-train').disabled = t.state === 'running';
+    this.el('lp-dry').disabled = t.state === 'running';
+  },
+
+  render() {
+    const box = this.el('lp-strip');
+    if (!this.pool.length) {
+      box.innerHTML = '<p class="empty-lp">No candidates yet — let it watch a stream.</p>';
+      return;
+    }
+    box.innerHTML = this.pool.map(it => `
+      <div class="lp-card" data-id="${it.id}">
+        <img src="/learn/thumb/${it.id}.jpg" alt="" loading="lazy">
+        <div class="lp-btns">
+          <button class="k" onclick="LearnUI.review('${it.id}','keep')">Keep</button>
+          <button class="d" onclick="LearnUI.review('${it.id}','drop')">Drop</button>
+          <button class="b" onclick="LearnUI.review('${it.id}','background')">Bg</button>
+        </div>
+      </div>`).join('');
+  },
+
+  async review(id, verdict) {
+    const card = this.el('lp-strip').querySelector(`[data-id="${id}"]`);
+    if (card) card.remove();
+    this.pool = this.pool.filter(p => p.id !== id);
+    try {
+      await fetch('/api/learn/review', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, verdict }),
+      });
+    } catch (e) { /* ignore */ }
+  },
+
+  async retrain(dry) {
+    if (!confirm(dry ? 'Assemble the training set (no training)?'
+      : 'Fine-tune a new model from the kept set? This takes a few minutes.')) return;
+    try {
+      const r = await fetch('/api/learn/retrain', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'detector', dry_run: !!dry }),
+      });
+      if (!r.ok) alert('Retrain: ' + ((await r.json()).error || r.status));
+    } catch (e) { alert('Retrain failed: ' + e); }
+  },
+};
+
+let isSwitching = false;
+let _modelSig = '';
+
+async function switchModel(name, isRef) {
+  if (isSwitching) return;
+  isSwitching = true;
+  document.querySelectorAll('#ms-buttons .ms-btn').forEach(b =>
+    b.classList.toggle('switching', b.dataset.name === name));
+  try {
+    const body = isRef ? { weights_ref: name } : { profile: name };
+    const res = await fetch('/api/switch-model', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) { console.error('switch failed', await res.text()); isSwitching = false; }
+  } catch (e) { console.error('switch error', e); isSwitching = false; }
+}
+
+async function refreshModels() {
+  let m;
+  try { m = await (await fetch('/api/models', { cache: 'no-store' })).json(); }
+  catch (e) { return; }
+  const sig = Object.keys(m.profiles).join(',');
+  if (sig === _modelSig) return;
+  _modelSig = sig;
+  const box = document.getElementById('ms-buttons');
+  box.innerHTML = Object.entries(m.profiles).map(([name, p]) => {
+    const badge = (p.ref && p.delta != null)
+      ? `<span class="ms-badge">${p.delta >= 0 ? '+' : ''}${(p.delta * 100).toFixed(1)} mAP</span>` : '';
+    const short = p.ref ? (p.label || name).replace(/^FT\s*/, 'FT ') : (p.label || name).split(' ')[0];
+    return `<button class="ms-btn" data-name="${name}" data-ref="${p.ref ? 1 : 0}"
+              onclick="switchModel('${name}', ${p.ref ? 'true' : 'false'})">${short}${badge}</button>`;
+  }).join('');
+}
+
+function updateModelUI(activeModel, switching) {
+  isSwitching = !!switching;
+  document.querySelectorAll('#ms-buttons .ms-btn').forEach(b => {
+    b.classList.remove('active', 'switching');
+    if (b.dataset.name === activeModel) b.classList.add('active');
+  });
+}
+
+async function poll() {
+  try {
+    const s = await (await fetch('/status', { cache: 'no-store' })).json();
+    connDot.className = 'live';
+    connLbl.textContent = 'Live';
+    renderStats(s);
+    renderDevices(s.devices || []);
+    refreshModels();
+    updateModelUI(s.active_model, s.switching);
+    LayoutUI.onStatus(s);
+    FenceUI.onStatus(s);
+    LearnUI.onStatus(s);
+
+    const camIds = Object.keys(s.meta || {}).map(Number);
+    if (camIds.length) startMosaic();
+
+    for (const camId of camIds) {
+      const meta = s.meta[camId];
+      if (meta.level !== 'Normal' && lastLevel[camId] !== meta.level) addLog(camId, meta);
+      lastLevel[camId] = meta.level;
+      const br = !!meta.breach;
+      if (br && !lastBreach[camId]) addFenceLog(camId, meta);
+      lastBreach[camId] = br;
+    }
+
+    // ANPR: log each newly-read plate once
+    const anpr = s.anpr || {};
+    for (const p of (anpr.active || [])) {
+      const key = p.cam + '|' + p.plate;
+      if (!seenPlates.has(key) && p.conf >= 0.20) {
+        seenPlates.add(key);
+        addPlateLog(p.cam, p.plate, p.conf, p.valid);
+      }
+    }
+    if (seenPlates.size > 400) seenPlates.clear();
+  } catch (e) {
+    connDot.className = 'error';
+    connLbl.textContent = 'Reconnecting…';
+  }
+  setTimeout(poll, 500);
+}
+
+LayoutUI.init();
+FenceUI.init();
+LearnUI.init();
+SnapUI.tick();
+refreshModels();
+poll();
+</script>
+</body>
+</html>

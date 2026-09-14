@@ -1,0 +1,24 @@
+{
+  "_comment": "Demo seed for virtual fences. Copy to the path in config.yaml geofence.store (default data/fences.json) before starting the server, or draw fences from the dashboard FENCES panel (which rewrites that file). Coordinates are normalised 0..1 of each camera's view; a polygon needs >=3 points, a line needs 2+ (each consecutive pair is a tripwire segment, so a bent fence line is one fence). direction is line-only: a2b | b2a | both. targets: any | person | vehicle.",
+  "fences": [
+    {
+      "id": "f_demo01",
+      "cam_id": 0,
+      "kind": "polygon",
+      "points": [[0.06, 0.55], [0.94, 0.55], [0.94, 0.95], [0.06, 0.95]],
+      "targets": ["person", "vehicle"],
+      "label": "Gate apron",
+      "enabled": true
+    },
+    {
+      "id": "f_demo02",
+      "cam_id": 1,
+      "kind": "line",
+      "points": [[0.2, 0.2], [0.5, 0.55], [0.85, 0.35]],
+      "direction": "both",
+      "targets": ["any"],
+      "label": "Perimeter line",
+      "enabled": true
+    }
+  ]
+}

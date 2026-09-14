@@ -1,0 +1,485 @@
+# ── Stream sources ───────────────────────────────────────────────────────────
+# server.py opens every entry here on startup, alongside phones:
+#   - url: rtsp://user:pass@ip:554/...   → a CCTV camera / NVR channel (pulled)
+#   - url: http://ip/video.mjpg          → an MJPEG camera or IP-Webcam app
+#   - url: "0" / "1"                     → a local USB/laptop webcam index
+#   - url: path\to\clip.mp4              → a video file (looped) — offline testing
+#   - url: ws   (or omit url)            → a slot a phone connects to via /cam/N
+# `zone_sensitivity` 0.0–1.0 feeds the risk score. `enabled: false` skips a row.
+# `transport` / `decode_fps` override the `cctv:` defaults per camera.
+#
+# ── Real CCTV: how to fill this in ──────────────────────────────────────────
+# Colleges usually give you NVR access (one IP + login, several channels), not
+# per-camera IPs. Use the sub-stream (low-res) for analytics. Full guide +
+# vendor URL table: docs/CCTV_INTEGRATION.md. Test a URL first:
+#   python rtsp_probe.py "rtsp://user:pass@10.0.0.50:554/..."
+# Discover cameras on the LAN:  python discover_cameras.py
+#
+#   Hikvision  main : rtsp://user:pass@IP:554/Streaming/Channels/101
+#              sub  : rtsp://user:pass@IP:554/Streaming/Channels/102
+#              (NVR: 101/201/301… = ch1/ch2/ch3 main, 102/202… = sub)
+#   Dahua/CP+  main : rtsp://user:pass@IP:554/cam/realmonitor?channel=1&subtype=0
+#              sub  : rtsp://user:pass@IP:554/cam/realmonitor?channel=1&subtype=1
+#   Axis            : rtsp://user:pass@IP/axis-media/media.amp?resolution=640x360
+#   Uniview         : rtsp://user:pass@IP:554/media/video2      (video1=main)
+#   generic ONVIF   : ask the camera via discover_cameras.py — paths vary
+#
+# Example — 4 NVR channels, sub-stream (delete/replace with your college's):
+# streams:
+#   - { id: 0, name: "Gate",     url: "rtsp://admin:pass@10.0.0.50:554/Streaming/Channels/102", zone_sensitivity: 0.9 }
+#   - { id: 1, name: "Corridor", url: "rtsp://admin:pass@10.0.0.50:554/Streaming/Channels/202", zone_sensitivity: 0.6 }
+#   - { id: 2, name: "Parking",  url: "rtsp://admin:pass@10.0.0.50:554/Streaming/Channels/302", zone_sensitivity: 0.7 }
+#   - { id: 3, name: "Perimeter",url: "rtsp://admin:pass@10.0.0.50:554/Streaming/Channels/402", zone_sensitivity: 0.9 }
+
+streams:
+  - id: 0
+    name: "Phone-0"
+    url: "ws"               # phone slot — open https://<ip>:8443/cam/0
+    zone_sensitivity: 0.8
+  - id: 1
+    name: "Phone-1"
+    url: "ws"
+    zone_sensitivity: 0.5
+
+# ── CCTV / RTSP defaults ─────────────────────────────────────────────────────
+# Applied to every pulled stream unless the stream overrides them.
+cctv:
+  transport: tcp          # tcp = reliable (recommended). udp = lower latency, tears on loss.
+  decode_fps: 15          # frames actually decoded per camera. Detection is 8 fps;
+                          # 10–15 is plenty and keeps CPU decode cost down with many cams.
+  reconnect_delay: 3.0    # seconds to wait before retrying a dropped stream
+  stall_timeout: 8.0      # no frame for this long → drop and reconnect
+  open_timeout: 8.0       # give up opening a stream after this long
+
+# ── Ingest / mobile devices ──────────────────────────────────────────────────
+# A phone browser opens https://<lan-ip>:8443/camera/<id>, is asked for
+# 1280x720@24, and streams JPEG frames over a WebSocket. Phones rarely honour
+# the exact request, so every incoming frame is rescaled to this size before it
+# reaches the pipeline — downstream code never sees a non-standard resolution.
+ingest:
+  normalise_width: 1280
+  normalise_height: 720
+
+# ── Model profiles (for live switching from the dashboard) ────────────────────
+# Each profile overrides model.weights and pose.weights when selected.
+# Switch via POST /api/switch-model {"profile": "nano"} or from the UI.
+#
+# Fine-tuned models are NOT listed here — `retrain.py` (continuous learning) and
+# `train_thermal.py` (night/IR) register them in models/registry.json, which the
+# server re-reads on every request. They appear in the dashboard MODEL row with a
+# base-vs-fine-tuned mAP badge and hot-swap through the same path. Switch to the
+# "Thermal / night" model for IR cameras, back to "Nano" for daytime.
+# See docs/CONTINUOUS_LEARNING.md and docs/THERMAL_NIGHT.md.
+model_profiles:
+  nano:
+    label:         "Nano (2.6M, 40.9 mAP)"
+    det_weights:   "yolo26n.pt"        # ~5.5 MB; auto-downloaded
+    pose_weights:  "yolo26n-pose.pt"   # ~7.5 MB; already downloaded
+    max_batch:     16
+  medium:
+    label:         "Medium (20.4M, 53.1 mAP)"
+    det_weights:   "yolo26m.pt"        # ~42 MB; auto-downloaded
+    pose_weights:  "yolo26m-pose.pt"   # ~60 MB; auto-downloaded
+    max_batch:     8                   # lower batch cap for 6 GB VRAM safety
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  weights: "yolo26n.engine"   # TensorRT 10.13 FP16 engine, built for this GPU by
+                          # export_engine.py. Fixed input shape (max_batch, 3, imgsz, imgsz);
+                          # the detector pads short batches to it. Inference runs on its own
+                          # worker thread (server.py) so the ~15-28 ms GPU call never blocks
+                          # the 24 Hz muxer — measured: 8 mobile streams at 192 fps, GPU ~37%.
+                          #
+                          # Fall back to "yolo26n.pt" only if the .engine is missing (not
+                          # yet exported on this machine) or a non-CUDA box. The .engine is
+                          # hardware-specific: re-run export_engine.py per GPU. See CLAUDE.md.
+  confidence: 0.40        # generic fallback bar; per-class floors below refine it
+  iou: 0.50
+  device: "0"             # "0" = GPU 0 (CUDA); "cpu" = CPU only (slow but works)
+  image_size: 640
+  half: true              # FP16 on CUDA — roughly 2x throughput on an RTX 3050
+
+  # ── Detection scope + per-class confidence ─────────────────────────────────
+  # Inference is restricted to these COCO ids (person, car, motorcycle, bus,
+  # truck) — cleaner output, slightly less NMS, no "chair / handbag" boxes.
+  classes: [0, 2, 3, 5, 7]
+  # Then a per-class floor: a LOWER bar for people (they matter most, we want
+  # recall) and a HIGHER bar for vehicles (kills parked-car / reflection FPs).
+  person_conf:  0.30
+  vehicle_conf: 0.40
+  # Max boxes returned per frame. 300 (the default) is far above the 10-15
+  # people + a few vehicles this is built for; raise only for genuine crowds.
+  max_det: 300
+
+
+  # ── Throughput controls ─────────────────────────────────────────────────────
+  # server.py runs an nvstreammux-style muxer: every camera's queue is drained
+  # continuously into a one-deep slot, and on a fixed tick (1 / stream_fps) the
+  # whole set of live slots goes to the model in ONE forward pass. The batch is
+  # then always "every connected camera", which is what makes the GPU cost
+  # sub-linear in camera count. Measured on an RTX 3050: batch of 1 = 12.3 ms,
+  # batch of 8 ≈ 18 ms — per-pass overhead dominates, so filling the batch is
+  # the whole game. (The old batch_window_ms setting is obsolete — the fixed
+  # tick replaced the collect-with-timeout approach.)
+  max_batch: 8            # max frames per batched call. Also the TensorRT engine's
+                          # dynamic-batch profile ceiling (export_engine.py reads this).
+                          # 8 covers the 8-stream target; raising it needs a re-export
+                          # and more VRAM during the TRT build.
+
+  # Detection runs at detect_fps while tracks are carried on every frame by
+  # linear extrapolation, so boxes stay smooth between detector passes.
+  stream_fps: 24          # source frame rate — also the muxer tick rate
+  detect_fps: 8           # detector passes per second per camera
+
+  # Cheap pre-filter: a static scene never reaches the GPU at all. This is also
+  # what drives the dashboard's live/idle state per device — "idle" means the
+  # gate below is currently skipping that stream, so no YOLO/ByteTrack runs.
+  # Lower pixel_threshold / area_threshold = more sensitive (more frames pass).
+  motion_gating: true
+  motion:
+    pixel_threshold: 18   # per-pixel intensity delta counted as change
+    area_threshold: 0.002 # fraction of pixels that must change (0.2%)
+    # The gate is only consulted on frames that already cleared the rate cap,
+    # so these counts are in gate calls, not raw frames. At detect_fps 8,
+    # force_every 8 means a static camera is still swept once per second.
+    force_every: 8        # always detect at least this often, regardless
+    hold_frames: 3        # keep the gate open briefly after motion stops
+
+# ── Tracker (ByteTrack) ─────────────────────────────────────────────────────
+# Tuned for CCTV: people walk behind pillars / vehicles, so tracks must coast
+# a good while before being dropped. frame_rate is taken from model.detect_fps.
+tracker:
+  activation_conf:     0.25   # a detection must clear this to (re)start a track
+  lost_buffer_frames:  60     # keep a lost track alive this many detection frames (~7 s at 8 fps)
+  match_thresh:        0.85   # IoU-distance match gate (higher = stricter re-association)
+
+# ── ANPR — number-plate recognition ─────────────────────────────────────────
+# Two-stage: a YOLOv8 plate detector (models/license_plate_detector.pt, MIT,
+# github.com/anindya-mukhopadhyay/ANPR) runs on each vehicle crop, then EasyOCR
+# reads it on a background thread. Needs:  pip install easyocr
+# If easyocr or the weights are missing the engine disables itself with a
+# warning — the rest of the pipeline is unaffected. See docs/ANPR.md.
+anpr:
+  enabled: true
+  weights: "models/license_plate_detector.pt"   # plate DETECTOR (YOLO). Fine-tune: training/train_anpr.py --detector
+  region: "IN"            # plate-format check: IN = Indian (SS RR L(L)(L) NNNN, or the BH series). "XX" = generic.
+  # Calibrated against real Indian street footage (see docs/ANPR.md,
+  # "Calibration") — 11/16 real plates read correctly, 1 false positive across
+  # 4 clips of real traffic. yolo_conf is intentionally low: every plausible
+  # box is read and only a grammar-valid, confidence-gated decode is trusted,
+  # so a low detector threshold costs GPU, not accuracy.
+  yolo_conf: 0.15         # plate-detector confidence (candidates only — see read_min_conf below)
+  ocr_min_conf: 0.20      # min confidence to log a plate to data/plates/plates.csv
+  min_plate_area: 300     # px² in the working (720p) frame — ignore specks
+  min_plate_width: 28     # px in the frame actually OCR'd (native res when available) — narrower is unreadable
+  max_plates_per_vehicle: 2   # read up to this many plate-shaped boxes per vehicle crop (badges/logos often outscore the real plate)
+  plate_pad_x: 0.10        # padding around each plate box before OCR, as a fraction of its width
+  plate_pad_y: 0.08        # ...and of its height
+  two_line_ratio: 0.42     # box height/width above this → also OCR'd as two stacked rows (motorcycles, autos, trucks)
+  plate_detect_every: 1   # run the plate detector every Nth detection tick — arrivals/follow-ups already self-pace (see below)
+  plate_imgsz: 320        # plate-detector input size (plates are small → small + fast)
+  cooldown_s: 8           # don't re-log the same plate string within this window
+  workers: 1              # OCR worker threads (1 is plenty for a few vehicles)
+  queue_size: 64          # OCR work queue depth — every candidate box is queued, not just the best one
+
+  # ── OCR backend ───────────────────────────────────────────────────────────
+  # "fast_plate" = fast-plate-ocr (plate-specific ONNX, no torch at runtime).
+  #   pip install "fast-plate-ocr[onnx-gpu]"   — falls back to "easyocr" if absent.
+  # ocr_model: a bundled name (default "cct-s-v2-global-model", downloaded once)
+  #   OR a "models/plate_ocr" directory from training/train_anpr.py --ocr (Indian
+  #   fine-tune). A missing local path auto-falls-back to the bundled model.
+  ocr_backend: "fast_plate"
+  ocr_model: "models/plate_ocr"   # local copy of cct-s-v2-global (offline; no hub download)
+  ocr_device: "auto"      # auto = cuda when model.device is a GPU, else cpu. Pins the
+                          # ONNX Runtime providers to CUDA/CPU only (skips the noisy,
+                          # unnecessary TensorRT EP probe). Set "cpu" to force CPU.
+  ocr_color: "bgr"         # colour space fed to the OCR model — measured best on real footage; "rgb" is the alternative
+  ocr_gray_retry: false    # also try a CLAHE-enhanced greyscale read when the colour read is weak — rarely helps, costs a 2nd OCR pass
+  edge_drop_max_conf: 0.60 # an edge character with best-guess confidence below this may be dropped to fit the plate grammar (plate-frame edge, "IND" strip) — never a character the OCR was actually sure of
+  max_corrections: 2       # legacy look-alike coercion: at most this many character swaps to force a reading into the Indian grammar
+
+  # ── Reading confidence + confirmation ─────────────────────────────────────
+  # Every OCR read is decoded under the Indian plate grammar using the model's
+  # full per-character probability output (not just its top guess), so e.g. a
+  # "0" the model was only 70% sure of still wins the RTO digit slot over a
+  # "O" that doesn't fit the grammar at all. A read below read_min_conf is
+  # discarded outright. A plate is only shown/logged/evidenced — "confirmed" —
+  # once confirm_min_reads independent reads agree, the fused confidence
+  # clears confirm_min_conf, and those agreeing reads are at least
+  # confirm_min_share of everything read for that vehicle (so one lucky read
+  # buried in ten different wrong ones doesn't confirm). A single very
+  # high-confidence read (single_read_min_char_conf on every character) may
+  # confirm alone — needed for a vehicle only glimpsed once.
+  read_min_conf: 0.45
+  confirm_min_reads: 2
+  confirm_min_conf: 0.50
+  confirm_min_share: 0.50
+  single_read_min_char_conf: 0.97
+  near_duplicate_window_s: 30.0   # a confirmed plate one edit away from another track's recent plate on the same camera is treated as the same vehicle (ByteTrack re-acquiring it under a new id), not logged as a second, slightly-wrong plate
+  log_unconfirmed: false          # also write not-yet-confirmed reads to plates.csv — for debugging only
+
+  # ── Multi-frame fusion (legacy vote, used when no probability sequence is
+  #    available — e.g. the EasyOCR fallback backend) ────────────────────────
+  vote_min_reads: 3        # start voting once a track has this many readings
+  vote_max_reads: 12       # ring-buffer cap per track
+  dataset_root: "E:/Projects/ibvap-datasets"   # datasets_fetch.py --anpr target (outside the repo)
+
+  # ── Event-triggered arrival (ibvap/anpr_events.py) ────────────────────────
+  # A vehicle track is only ever submitted for OCR on its "arrival" tick (the
+  # first time it's tracked), plus a bounded number of follow-up reads to feed
+  # the fusion above — not on every qualifying tick for as long as it's parked
+  # in frame. Once either limit is hit, or enough confirmed reads exist (see
+  # stop_after_confirmed_reads), the track goes idle: no further plate-detector
+  # calls for it until it disappears and a different track_id genuinely
+  # arrives. The window is generous (a full minute) because a real plate is
+  # often unreadable on arrival and only resolves as the vehicle gets closer.
+  arrival_followup_reads: 60   # bounded extra OCR looks after the arrival snapshot
+  arrival_followup_s: 60.0     # ...or this many seconds, whichever comes first
+  stop_after_confirmed_reads: 3   # once a plate has this many confirming reads, stop re-submitting the vehicle (still bounded by the window above)
+
+# ── Vehicle-type classification (Car / Pickup truck / Truck / Jeep / 2-wheeler /
+#    Tanker / Van / Auto-rickshaw) ───────────────────────────────────────────
+# A dedicated classifier (training/train_vehicle_type.py) run once per vehicle
+# arrival, alongside the plate OCR. Until models/vehicle_type_classifier.pt
+# exists, every result is a coarse fallback from the main detector's COCO class
+# (car/motorcycle/bus/truck only — jeep/pickup_truck/tanker/auto_rickshaw need
+# the trained model) with conf=0.0 and fallback=true.
+vehicle_type:
+  enabled: true
+  weights: "models/vehicle_type_classifier.pt"
+  imgsz: 224
+  min_conf: 0.35
+  fallback_coco: true
+  dataset_root: "E:/Projects/ibvap-datasets"
+
+# ── Dedicated ANPR output folder ─────────────────────────────────────────────
+# One picture + one JSON record (plate, vehicle type, both confidences) per
+# vehicle arrival, under data/anpr_results/<cam_id>/ — deliberately separate
+# from data/snapshots/ (breach/weapon/posture) and from data/plates/plates.csv
+# (AnprEngine's own running OCR log) and data/learning/plates.jsonl (the
+# continuous-learning harvester's pool). This is the store the app browses.
+anpr_results:
+  enabled: true
+  dir: "data/anpr_results"
+  jpeg_quality: 90
+  log_to_evidence: true      # bind each result's sha256 into the hash chain, like every other alert
+  finalize_timeout_s: 6.0    # file the record (plate: null) if OCR never resolves within this long
+
+# ── Pose / skeleton anomaly detection ────────────────────────────────────────
+# Runs yolo26n-pose.pt on person bounding-box crops after the detection pass.
+# Set enabled: false to disable without touching any Python code.
+pose:
+  enabled: true
+  weights: "yolo26n-pose.pt"   # auto-downloaded by Ultralytics on first run (~6.5 MB)
+  kp_conf: 0.5                 # joints below this visibility score are ignored
+  # Person crops from every camera in a detection batch go through the pose
+  # head together. In a crowd that batch grows fast (streams x people), so:
+  #   max_batch   — crops per pose predict() call; the rest run in more chunks.
+  #                 Bounds VRAM + keeps per-call latency predictable. ~24 covers
+  #                 15 people on one stream in a single call; lower it on a
+  #                 smaller GPU, raise it if you have headroom.
+  #   max_persons — pose crops per camera per pass. 10-15 people are covered
+  #                 with margin; beyond this the biggest (nearest) boxes win and
+  #                 the rest keep their last skeleton — the detector/tracker
+  #                 still count and follow everyone.
+  max_batch:   24
+  max_persons: 24
+  imgsz:       256   # pose crops are resized to this square before inference;
+                     # fixed size = constant tensor shape = no cuDNN re-tune churn
+  # Geometry thresholds. All are RATIOS of the person's own torso length
+  # (shoulder-mid -> hip-mid) or shoulder width, so they behave the same for a
+  # person 40 px or 400 px tall. See ibvap/posture.py PoseClassifier.
+  lying_ratio:        0.45  # visible-skeleton height/width below this ...
+  lying_torso_deg:    55    # ... AND torso tilted more than this from vertical -> lying
+  crouch_knee_ratio:  0.35  # knees risen to within 0.35 * torso below the hips -> crouching
+  crouch_ratio:       0.60  # or torso < 60% of this track's upright baseline ...
+  crouch_knee_soft:   0.60  # ... with knees within 0.60 * baseline below the hips
+  scan_window:        12    # frames of head-yaw history
+  scan_std_ratio:     0.22  # std-dev of head yaw (nose offset / shoulder width) -> vigorous scan
+  scan_min_facing:    0.30  # only judge yaw when shoulders are >= 0.30 * torso wide (facing camera)
+  arms_up_margin_ratio: 0.12 # wrist above the shoulder line by 0.12 * torso ...
+  arms_up_both:       true  # ... on BOTH arms (surrender / overhead). One raised hand = waving.
+  min_visible_kp:     9     # skeletons with fewer confident joints are not judged (distant / occluded)
+  min_skeleton_px:    70    # ... nor skeletons shorter than this many pixels
+  hold_frames:        3     # a posture must persist this many detection frames to switch on
+  release_frames:     2     # and may drop out this many frames before switching off (no flicker)
+  # Rule 5 — weapon-ready posture (2D-skeleton heuristic, NOT gun detection).
+  # AIM alone raises the camera to High; with a confirmed gun it is Critical (risk_engine). Tuned to
+  # catch a real two-handed gun hold; loosen if aim stances are missed, tighten
+  # if innocent two-handed poses (phone, mug) trip it. See src/posture.py Rule 5.
+  aim_band_above:     0.60   # wrist band top    = 0.60 * body-height above the shoulder line (≈ forehead)
+  aim_band_below:     0.55   # wrist band bottom = 0.55 * body-height below the shoulder line (≈ navel)
+  aim_wrist_sep:      0.85   # hands within 0.85 * shoulder-width of each other
+  aim_wrist_level:    0.60   # hands within 0.60 * shoulder-width of the same height
+  aim_center_margin:  0.55   # hands within 0.55 * shoulder-width of the shoulder span (in front of the torso)
+  aim_wrist_above_hip: 0.10  # each hand at least 0.10 * body-height above the hip (arms off the thighs)
+  aim_hold_frames:    3      # raw geometry must persist this many detection frames before AIM fires
+
+
+# ── Weapon detection (trained firearm object model) ─────────────────────────
+# A dedicated small YOLO (models/weapon_detector.pt, one class `gun`, trained by
+# `python train_weapon.py` on the YouTube-GDD dataset) runs as one extra batched
+# pass over each camera frame — like ANPR/pose, it never touches the person /
+# vehicle detector. A gun box is only a CONFIRMED threat when it is (a) held —
+# overlapping or inside a tracked person's box — and (b) has persisted for
+# `hold_frames` weapon passes. src/risk_engine.py then fuses it with the AIM
+# posture heuristic:  AIM only → "WEAPON (posture)";  confirmed gun → "GUN
+# DETECTED";  AIM + gun on one track → "ARMED THREAT" (score 99).
+# If the weights are missing the engine disables itself and the pipeline is
+# unaffected — so this stays on safely before the model is trained.
+# See docs/WEAPON_DETECTION.md.
+weapon:
+  enabled: true
+  weights: "models/weapon_detector.pt"
+  dataset_root: "E:/Projects/ibvap-datasets"   # downloaded datasets live OUTSIDE the repo
+  # Measured on 497 YouTube-GDD val images (718 guns): conf>=0.30 -> recall 0.73 /
+  # precision 0.88, zero false boxes on gun-free images; 0.45 -> 0.69 / 0.94. Small
+  # guns (<1% of the frame) are the weak spot (~15% found) until the model is
+  # retrained on more distant / CCTV-angle footage.
+  min_conf: 0.30           # candidate threshold (a candidate alone never alerts)
+  confirm_conf: 0.40       # at least one hit in the vote window must reach this
+  min_box_area: 400        # px² — ignore specks (logos, HUD text)
+  max_box_frame_frac: 0.20 # a 'gun' covering >20% of the frame is a false positive
+  max_box_person_frac: 0.55 # ... as is one larger than 55% of its holder's box (silhouette)
+  person_contain_min: 0.5  # >= half the gun box inside a person box (grown 10%) to count as "held"
+  wrist_margin: 0.12       # when the person's wrists are visible, one must be within 0.12 * their height of the gun box
+  hold_hits: 2             # held-gun hits needed ...
+  hold_window: 4           # ... within this many recent weapon passes -> "confirmed" (not consecutive)
+  confirm_on_aim: true     # a held gun on a person in an AIM posture confirms immediately
+  detect_every: 3          # run the weapon model every Nth detection tick (~2.7 fps/cam). The
+                           # weapon model is a PyTorch .pt (not the TensorRT engine), so on the
+                           # RTX 3050 alongside detector+pose+ANPR, every-2 cost ~16 fps of
+                           # worker throughput at 2 cams; every-3 holds ~47 fps. hit_ttl_s
+                           # keeps the box on screen between passes. Lower to 2 on a bigger GPU
+                           # or after exporting the weapon model to TensorRT.
+  imgsz: 640               # 960 finds ~30% more small/distant guns at ~2.25x the GPU cost
+  hit_ttl_s: 1.5           # keep drawing a confirmed gun box this long between weapon passes
+  classes: ["gun"]
+
+
+# ── Risk scoring ──────────────────────────────────────────────────────────────
+risk:
+  threshold_critical: 70   # only used when score_can_reach_critical is true
+  score_can_reach_critical: false   # person/vehicle presence tops out at High; Critical = weapon / fence breach only
+  posture_aim_level: "High"        # AIM skeleton heuristic alone -> High; a CONFIRMED gun is always Critical
+  threshold_high: 50
+  weights:
+    zone: 0.40
+    time_of_day: 0.20
+    behaviour: 0.40
+
+# ── Digital fencing / virtual fence ─────────────────────────────────────────
+# The operator draws polygon zones and multi-point directional fence lines on each
+# camera's own view in the dashboard (FENCES panel). Geometry is stored in
+# normalised 0..1 image coordinates per camera in `store` below — NOT on a
+# geographic map: the platform has no camera calibration, so image-space fences
+# can't be geo-projected (see docs/GEOFENCE.md). A tracked person/vehicle whose
+# ground point (bbox bottom-centre) enters a zone, or whose path crosses a line
+# in the flagged direction, is flagged CRITICAL and written to the hash-chained
+# evidence log — the same override path as a weapon-ready posture.
+# Edit fences from the dashboard, not here: POST /api/fences reloads them live.
+geofence:
+  enabled: true
+  store: "data/fences.json"       # created/rewritten by the dashboard; seed from fences.example.json
+  eval_on: "detect"              # "detect" = only real detection passes (8 fps); "track" = every frame
+  reentry_cooldown_passes: 8     # a tripwire won't re-fire for the same track within this many passes
+  exit_passes: 2                 # consecutive "outside" passes before a zone breach is considered over
+                                # (stops a target on the zone edge re-firing every pass)
+
+# ── Intrusion snapshots ────────────────────────────────────────────────────
+# On a virtual-fence breach, a confirmed weapon, or a malicious posture
+# (crouching / lying) the inference worker saves JPEG(s) of that exact frame
+# under data/snapshots/<cam_id>/ — folder "0" for camera 0, "1" for camera 1,
+# each created the first time that camera produces a frame. Every event appends
+# a line to that folder's index.jsonl, and the annotated image's SHA-256 is
+# embedded in the hash-chained evidence record so the file is tamper-evident.
+# Rare, edge-triggered events — encoded inline on the worker. See docs/INTRUSION.md.
+snapshots:
+  enabled: true
+  dir: "data/snapshots"
+  annotated: true          # save the frame with boxes / skeleton / fence overlay burned in
+  raw: true                # also save the untouched camera frame (evidential)
+  jpeg_quality: 90
+  cooldown_s: 20.0         # per (camera, track, reason) — one snapshot per ongoing event
+  on_breach: true
+  on_weapon: true
+  on_posture: true         # crouching / lying
+  escalate_posture: false  # also force the camera's risk level to Critical on a malicious posture
+
+# ── Continuous learning ─────────────────────────────────────────────────────
+# The pipeline continuously mines training examples from every stream (and from
+# screen_watch.py --learn): a detection that is BOTH high-confidence AND stable
+# across several detection passes is auto-labelled into data/learning/. The
+# operator confirms / discards / marks-background in the dashboard LEARNING
+# panel; `python retrain.py` then fine-tunes yolo26n.pt on the kept set, reports
+# a before/after mAP, and registers a new model you hot-swap in (and roll back).
+# Separately, per-camera "calibration" nudges the confidence floors and
+# suppresses learned false-positive regions LIVE — no training, no weight
+# changes. See docs/CONTINUOUS_LEARNING.md. Nothing here changes model weights
+# on its own.
+learning:
+  enabled: true
+  paths:
+    dataset:     "datasets/ibvap_live"
+    pool:        "data/learning"
+    calibration: "data/calibration.json"
+    registry:    "models/registry.json"
+  harvest:
+    min_conf:            0.55   # only pseudo-label a box above this confidence
+    min_track_frames:    5      # consecutive INFERRED passes before a track counts as "stable"
+    ambiguous_conf:      0.25   # skip a whole frame if any box sits in [ambiguous_conf, min_conf)
+    per_cam_rate_limit_s: 3.0   # at most one harvested frame per camera per this many seconds
+    max_pool:            5000   # stop harvesting once this many candidates are pending review
+    jpeg_quality:        85
+    classes:             [0, 2, 3, 5, 7]   # COCO ids kept in pseudo-labels (person + 4 vehicle types)
+  calibration:
+    enabled:              true
+    ema_alpha:            0.02
+    decay_per_day:        0.5   # halve the learned counts every this-many days (old FPs fade)
+    headroom:             0.05  # how far calibration may LOOSEN a confidence floor
+    max_tighten:          0.30  # how far it may RAISE one
+    grid:                 [32, 18]
+    promote_cell_after:   25    # "died young" detections in a grid cell before it becomes a suppression cell
+    min_obs_before_apply: 300   # observations per camera before any adjustment is applied
+  retrain:
+    epochs:        40
+    imgsz:         640
+    freeze:        10           # freeze the backbone — limits catastrophic forgetting
+    val_fraction:  0.2
+    replay_images: 300          # COCO-val person/vehicle images mixed in against forgetting
+    min_images:    20           # refuse to train below this many kept frames (raise for a real run)
+
+# ── Display ───────────────────────────────────────────────────────────────────
+display:
+  grid_cols: 3            # max columns in the multi-stream grid
+  cell_width: 640         # each stream cell width in pixels
+  cell_height: 360        # each stream cell height in pixels
+
+# ── Evidence / storage ────────────────────────────────────────────────────────
+evidence:
+  db_path: "data/events.db"
+  hash_chain_path: "data/hash_chain.jsonl"
+  log_level: "High"       # log events at this level and above ("High" or "Critical")
+
+# ── Network exposure (ibvap/security.py) ──────────────────────────────────────
+# IBVAP is one local product: the app, API, dashboard and video streams are
+# only reachable from this machine. Outbound traffic (CCTV pulls, alert
+# delivery, blockchain anchoring) is unaffected.
+# CURRENT SETTINGS ARE FOR TESTING WITH PHONES. To lock the product down to
+# this machine once phones are removed, set:
+#   network.bind_host: "127.0.0.1"
+#   network.lan_phone_intake: false
+#   security.require_token: true
+network:
+  bind_host: "0.0.0.0"          # testing: reachable on the LAN. "127.0.0.1" = this machine only
+  lan_phone_intake: true        # phones stream in over HTTPS :8443/cam/<id>
+
+# ── API write security (ibvap/security.py) ────────────────────────────────────
+# POST/PUT/DELETE under /api/ (shutdown, camera URLs, fences, model swap,
+# retrain) need the token below in an X-IBVAP-Token header, unless they come
+# from this machine. The token is generated on first start; copy it to any
+# remote command client (Settings > Server > API token).
+security:
+  require_token: false          # testing: no token needed for changes. true = enforce
+  token_file: "data/api_token"
+  allow_loopback_writes: true   # false = even localhost must present the token

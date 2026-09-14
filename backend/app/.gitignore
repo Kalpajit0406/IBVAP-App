@@ -1,0 +1,72 @@
+# ── Model weights & exports ─────────────────────────────────────────────────
+# .pt weights auto-download on first run (Ultralytics); the .engine is
+# hardware-specific and must be re-exported per GPU (python export_engine.py).
+*.pt
+*.engine
+*.onnx
+# ...but DO ship the ANPR plate detector — it's a custom fine-tune, not
+# something Ultralytics can auto-download (6 MB, MIT). See models/README.md.
+!models/license_plate_detector.pt
+# ...and the trained weapon detector (yolo26n fine-tune on YouTube-GDD, ~6 MB),
+# so a fresh clone can demo gun detection without re-training. See models/README.md.
+!models/weapon_detector.pt
+
+# ── Generated test media ────────────────────────────────────────────────────
+# Rebuild with:  python make_test_videos.py
+test_videos/
+test_input.*
+*_detected.*
+
+# ── TLS (regenerate: python gen_cert.py) ────────────────────────────────────
+cert.pem
+key.pem
+
+# ── Runtime data ────────────────────────────────────────────────────────────
+data/
+*.db
+*.db-wal
+*.db-shm
+*.jsonl
+
+# ── Continuous learning / fine-tunes ───────────────────────────────────────
+# Harvested datasets + training runs are large + machine-specific. The
+# fine-tuned weights (continuous-learning yolo26n_ft_*.pt AND night
+# yolo26n_thermal_*.pt) are git-ignored by `models/*.pt` below; only the small
+# tracked JSONs (models/registry.json, models/weapon_registry.json) travel with
+# the repo. Re-train with retrain.py / train_thermal.py per machine.
+datasets/
+!datasets/README.md
+runs/
+models/*.pt
+!models/license_plate_detector.pt
+# The weapon detector IS shipped (custom yolo26n fine-tune, ~5 MB) — re-negate
+# it here because this later `models/*.pt` rule would otherwise win. See
+# models/README.md / docs/WEAPON_DETECTION.md.
+!models/weapon_detector.pt
+# The plate OCR (fast-plate-ocr ONNX + config, ~few MB) also ships so the demo
+# reads plates out of the box. Timestamped runs stay ignored.
+!models/plate_ocr/
+!models/plate_ocr/**
+models/license_plate_detector_*.pt
+models/yolo26n_thermal_*.pt
+
+# ── cloudflared credentials (never commit) ──────────────────────────────────
+*.cloudflared/
+cloudflared.yml
+!cloudflared.example.yml
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# ── Editor / OS ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+nohup.out
