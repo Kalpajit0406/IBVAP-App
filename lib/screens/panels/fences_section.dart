@@ -1,0 +1,312 @@
+import 'package:flutter/material.dart';
+
+import '../../state/app_state.dart';
+import '../../theme.dart';
+
+class FencesSection extends StatefulWidget {
+  const FencesSection({super.key, required this.state});
+  final AppState state;
+
+  @override
+  State<FencesSection> createState() => _FencesSectionState();
+}
+
+class _FencesSectionState extends State<FencesSection> {
+  final _label = TextEditingController();
+  int? _cam;
+
+  @override
+  void dispose() {
+    _label.dispose();
+    super.dispose();
+  }
+
+  Future<void> _snack(String? err) async {
+    if (err != null && mounted) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(err)));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: Listenable.merge([widget.state, widget.state.fences]),
+      builder: (context, _) {
+        final ed = widget.state.fences;
+        final ids = widget.state.status?.cameraIds ?? const <int>[];
+        _cam ??= ed.draftCam ?? (ids.isNotEmpty ? ids.first : null);
+        if (_cam != null && ids.isNotEmpty && !ids.contains(_cam)) {
+          _cam = ids.first;
+        }
+        // keep the label field in step when an edit loads a fence
+        if (ed.armed && ed.editingId != null && _label.text != ed.label) {
+          _label.text = ed.label;
+        }
+        final active = widget.state.status?.geofenceActive ?? const {};
+
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _dropdown<int?>(
+                value: _cam,
+                hint: 'pick a camera',
+                items: [
+                  for (final id in ids)
+                    DropdownMenuItem(
+                        value: id,
+                        child: Text('CAM-${id.toString().padLeft(2, '0')}')),
+                ],
+                onChanged: ed.armed ? null : (v) => setState(() => _cam = v),
+              ),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Expanded(
+                      child: _pill('Zone', ed.kind == 'polygon',
+                          () => ed.setKind('polygon'), ed.armed)),
+                  const SizedBox(width: 4),
+                  Expanded(
+                      child: _pill('Line', ed.kind == 'line',
+                          () => ed.setKind('line'), ed.armed)),
+                ],
+              ),
+              const SizedBox(height: 6),
+              _dropdown<String>(
+                value: ed.targets,
+                items: const [
+                  DropdownMenuItem(value: 'any', child: Text('Any target')),
+                  DropdownMenuItem(
+                      value: 'person', child: Text('Person only')),
+                  DropdownMenuItem(
+                      value: 'vehicle', child: Text('Vehicle only')),
+                ],
+                onChanged: (v) => ed.setTargets(v ?? 'any'),
+              ),
+              if (ed.kind == 'line') ...[
+                const SizedBox(height: 6),
+                _dropdown<String>(
+                  value: ed.direction,
+                  items: const [
+                    DropdownMenuItem(
+                        value: 'both', child: Text('Cross either way')),
+                    DropdownMenuItem(value: 'a2b', child: Text('Cross A → B')),
+                    DropdownMenuItem(value: 'b2a', child: Text('Cross B → A')),
+                  ],
+                  onChanged: (v) => ed.setDirection(v ?? 'both'),
+                ),
+              ],
+              const SizedBox(height: 6),
+              TextField(
+                controller: _label,
+                style: const TextStyle(fontSize: 12, color: IbvapColors.text),
+                decoration: const InputDecoration(hintText: 'label (optional)'),
+                onChanged: ed.setLabel,
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: _btn(
+                      ed.armed ? 'Drawing…' : 'Draw',
+                      ed.armed || _cam == null
+                          ? null
+                          : () => ed.startDraw(_cam!, ed.kind),
+                      accent: ed.armed,
+                    ),
+                  ),
+                  const SizedBox(width: 5),
+                  Expanded(
+                    child: _btn('Clear cam', _cam == null || ed.busy
+                        ? null
+                        : () async {
+                            final ok = await showDialog<bool>(
+                              context: context,
+                              builder: (_) => AlertDialog(
+                                backgroundColor: IbvapColors.surface,
+                                title: const Text('Clear fences'),
+                                content: Text(
+                                    'Remove all fences on CAM-${_cam.toString().padLeft(2, '0')}?'),
+                                actions: [
+                                  TextButton(
+                                      onPressed: () =>
+                                          Navigator.pop(context, false),
+                                      child: const Text('Cancel')),
+                                  TextButton(
+                                      onPressed: () =>
+                                          Navigator.pop(context, true),
+                                      child: const Text('Clear')),
+                                ],
+                              ),
+                            );
+                            if (ok == true) _snack(await ed.clearCam(_cam!));
+                          }),
+                  ),
+                ],
+              ),
+              if (ed.armed) ...[
+                const SizedBox(height: 5),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _btn(
+                          ed.editingId != null ? 'Save edit' : 'Save',
+                          ed.canSave && !ed.busy
+                              ? () async => _snack(await ed.save())
+                              : null),
+                    ),
+                    const SizedBox(width: 5),
+                    Expanded(child: _btn('Cancel', ed.cancel)),
+                  ],
+                ),
+              ],
+              const SizedBox(height: 10),
+              if (ed.error != null)
+                Text(ed.error!,
+                    style:
+                        const TextStyle(color: IbvapColors.red, fontSize: 10)),
+              _list(ed, active),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _list(dynamic ed, Map<String, dynamic> active) {
+    final fences = ed.fences as List;
+    if (fences.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 10),
+        child: Text('No fences yet.',
+            style: TextStyle(color: IbvapColors.muted, fontSize: 11)),
+      );
+    }
+    return Column(
+      children: [
+        for (final f in fences)
+          _fenceRow(f, active['${f.camId}'] is Map &&
+              (active['${f.camId}'] as Map)[f.id] == true, ed),
+      ],
+    );
+  }
+
+  Widget _fenceRow(dynamic f, bool hot, dynamic ed) {
+    final npts = (f.points as List).length;
+    final kindTxt = f.kind == 'line'
+        ? (npts > 2 ? 'line · ${npts - 1} seg' : 'line')
+        : 'zone';
+    return Container(
+      decoration: BoxDecoration(
+        color: hot ? const Color(0x22EF4444) : null,
+        border: const Border(bottom: BorderSide(color: IbvapColors.border)),
+      ),
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 28,
+            child: Checkbox(
+              value: f.enabled as bool,
+              visualDensity: VisualDensity.compact,
+              onChanged: (v) async => _snack(
+                  await ed.setEnabled(f.id as String, v ?? true)),
+            ),
+          ),
+          Expanded(
+            child: InkWell(
+              onTap: ed.armed ? null : () => ed.startEdit(f.id as String),
+              child: Text.rich(
+                TextSpan(children: [
+                  TextSpan(
+                      text: 'CAM-${f.camId.toString().padLeft(2, '0')} ',
+                      style: const TextStyle(
+                          color: Color(0xFF94A3B8),
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700)),
+                  if ((f.label as String).isNotEmpty)
+                    TextSpan(
+                        text: '· ${f.label} ',
+                        style: const TextStyle(
+                            color: IbvapColors.text, fontSize: 11)),
+                  TextSpan(
+                      text: kindTxt,
+                      style: const TextStyle(
+                          color: IbvapColors.blue,
+                          fontSize: 9,
+                          fontWeight: FontWeight.w700)),
+                ]),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.close, size: 14),
+            color: IbvapColors.muted,
+            visualDensity: VisualDensity.compact,
+            tooltip: 'Delete',
+            onPressed: ed.busy
+                ? null
+                : () async => _snack(await ed.delete(f.id as String)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _dropdown<T>({
+    required T value,
+    String? hint,
+    required List<DropdownMenuItem<T>> items,
+    required ValueChanged<T?>? onChanged,
+  }) {
+    return DropdownButtonFormField<T>(
+      initialValue: value,
+      isDense: true,
+      hint: hint == null ? null : Text(hint),
+      style: const TextStyle(fontSize: 12, color: IbvapColors.text),
+      dropdownColor: IbvapColors.surfaceAlt,
+      items: items,
+      onChanged: onChanged,
+    );
+  }
+
+  Widget _pill(String label, bool on, VoidCallback onTap, bool disabled) {
+    return InkWell(
+      onTap: disabled ? null : onTap,
+      borderRadius: BorderRadius.circular(kRadius),
+      child: Container(
+        alignment: Alignment.center,
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        decoration: BoxDecoration(
+          color: on ? IbvapColors.green : IbvapColors.surfaceAlt,
+          borderRadius: BorderRadius.circular(kRadius),
+          border: Border.all(color: IbvapColors.border),
+        ),
+        child: Text(label,
+            style: TextStyle(
+                color: on ? Colors.black : IbvapColors.muted,
+                fontSize: 11,
+                fontWeight: FontWeight.w700)),
+      ),
+    );
+  }
+
+  Widget _btn(String label, VoidCallback? onTap, {bool accent = false}) {
+    return SizedBox(
+      height: 30,
+      child: OutlinedButton(
+        onPressed: onTap,
+        style: OutlinedButton.styleFrom(
+          padding: EdgeInsets.zero,
+          foregroundColor: accent ? IbvapColors.orange : IbvapColors.text,
+          side: BorderSide(
+              color: accent ? IbvapColors.orange : IbvapColors.border),
+        ),
+        child: Text(label, style: const TextStyle(fontSize: 11)),
+      ),
+    );
+  }
+}
