@@ -57,6 +57,9 @@ class Detection:
     plate_conf: float = 0.0
     vehicle_type: Optional[str] = None            # set by VehicleTypeClassifier
     vehicle_type_conf: float = 0.0
+    face_name: Optional[str] = None               # matched watchlist identity, once its burst finalizes
+    face_conf: float = 0.0                        # similarity of that match
+    on_watchlist: bool = False                    # True only while the match is still TTL-fresh
 
 
 @dataclass
@@ -71,6 +74,7 @@ class StreamResult:
     inferred: bool = False        # True when the detector actually ran
     gated: bool = False           # True when motion gating skipped it
     weapons: list = field(default_factory=list)   # WeaponHit list (src/weapon.py); [] on carried frames
+    faces: list = field(default_factory=list)     # FaceHit list (ibvap/face.py); [] on carried frames
 
 
 @dataclass
@@ -132,12 +136,14 @@ class Detector:
     def from_profile(cls, config: dict, profile: str, num_cameras: int = 0,
                      anpr=None, calibrator=None, weapon=None, vehicle_type=None,
                      anpr_results=None, vehicle_arrival=None,
-                     native_frame_fn=None) -> "Detector":
+                     native_frame_fn=None, face=None, face_arrival=None,
+                     face_results=None) -> "Detector":
         """Build a Detector using a named model_profiles entry.
 
         `anpr` / `calibrator` / `weapon` / `vehicle_type` / `anpr_results` /
-        `vehicle_arrival` — pass existing instances to reuse them across a
-        hot-swap instead of losing their per-camera state.
+        `vehicle_arrival` / `face` / `face_arrival` / `face_results` — pass
+        existing instances to reuse them across a hot-swap instead of losing
+        their per-camera state.
         """
         profiles = config.get("model_profiles", {})
         if profile not in profiles:
@@ -152,14 +158,16 @@ class Detector:
         return cls(patched, num_cameras=num_cameras, anpr=anpr,
                    calibrator=calibrator, weapon=weapon, vehicle_type=vehicle_type,
                    anpr_results=anpr_results, vehicle_arrival=vehicle_arrival,
-                   native_frame_fn=native_frame_fn)
+                   native_frame_fn=native_frame_fn, face=face,
+                   face_arrival=face_arrival, face_results=face_results)
 
     @classmethod
     def from_weights(cls, config: dict, det_weights: str, pose_weights: str,
                      label: str = "", num_cameras: int = 0, anpr=None,
                      calibrator=None, weapon=None, vehicle_type=None,
                      anpr_results=None, vehicle_arrival=None,
-                     native_frame_fn=None) -> "Detector":
+                     native_frame_fn=None, face=None, face_arrival=None,
+                     face_results=None) -> "Detector":
         """Build a Detector from explicit weight paths (a fine-tuned model from
         the continuous-learning registry). Paths are allowlisted to `models/`
         or the repo-root `yolo26*.pt` files."""
@@ -178,12 +186,14 @@ class Detector:
         return cls(patched, num_cameras=num_cameras, anpr=anpr,
                    calibrator=calibrator, weapon=weapon, vehicle_type=vehicle_type,
                    anpr_results=anpr_results, vehicle_arrival=vehicle_arrival,
-                   native_frame_fn=native_frame_fn)
+                   native_frame_fn=native_frame_fn, face=face,
+                   face_arrival=face_arrival, face_results=face_results)
 
     def __init__(self, config: dict, num_cameras: int = 0, anpr=None,
                  calibrator=None, weapon=None, vehicle_type=None,
                  anpr_results=None, vehicle_arrival=None,
-                 native_frame_fn=None) -> None:
+                 native_frame_fn=None, face=None, face_arrival=None,
+                 face_results=None) -> None:
         m = config["model"]
         self._weights = str(m["weights"])
         # A TensorRT .engine (or .onnx) is already bound to its device and only
@@ -350,6 +360,35 @@ class Detector:
         self._native_frame_fn = native_frame_fn
         self._vehicle_passes = 0
         self._vehicle_types: dict[tuple[int, int], "VehicleTypeResult"] = {}
+
+        # ── Face recognition (off unless face.enabled and gallery+weights
+        #    present) — a small curated watchlist gallery, not a trained model
+        #    fine-tune; see ibvap/face.py, docs/FACE_RECOGNITION.md ───────────
+        face_cfg = config.get("face", {}) or {}
+        if face is not None:
+            self.face = face                       # reused across a hot-swap
+        elif face_cfg.get("enabled"):
+            from .face import FaceEngine
+            feng = FaceEngine(face_cfg, device=self._device)
+            self.face = feng if feng.available else None
+        else:
+            self.face = None
+
+        # ── Event-triggered face capture: per-person burst tracker + writer ──
+        from .face_events import PersonArrivalTracker, FaceResultWriter
+        self._face_arrival = (face_arrival if face_arrival is not None
+                              else PersonArrivalTracker(
+                                  burst_n=int(face_cfg.get("burst_n", 5)),
+                                  max_attempts=int(face_cfg.get("max_attempts", 15)),
+                                  attempt_window_s=float(face_cfg.get("attempt_window_s", 8.0)),
+                                  vote_min=int(face_cfg.get("vote_min", 3)),
+                                  hit_ttl_s=float(face_cfg.get("hit_ttl_s", 4.0))))
+        self.face_results = (face_results if face_results is not None
+                             else FaceResultWriter(config))
+        self._face_use_native = bool(face_cfg.get("use_native_frame", True))
+        self._face_detect_every = max(1, int(face_cfg.get("detect_every", 2)))
+        self._face_passes = 0
+        self._face_arrivals: list[dict] = []   # finalized burst records, drained by server.py
 
         logger.info(
             "Detector ready: %s | device=%s | imgsz=%d | conf=%.2f | fp16=%s | "
@@ -549,6 +588,7 @@ class Detector:
         self._pose_pass(staged)
         self._vehicle_pass(staged)
         weapons_by_cam = self._weapon_pass(staged)
+        faces_by_cam = self._face_pass(staged)
 
         # 3. Draw overlays and package one StreamResult per camera.
         return [
@@ -556,8 +596,10 @@ class Detector:
                 cam_id, ts, frame, dets,
                 sum(1 for d in dets if d.is_person),
                 sum(1 for d in dets if d.is_vehicle),
-                self._annotate(frame, dets, weapons=weapons_by_cam.get(cam_id)),
+                self._annotate(frame, dets, weapons=weapons_by_cam.get(cam_id),
+                               faces=faces_by_cam.get(cam_id)),
                 inferred=True, weapons=weapons_by_cam.get(cam_id, []),
+                faces=faces_by_cam.get(cam_id, []),
             )
             for cam_id, ts, frame, dets in staged
         ]
@@ -830,6 +872,94 @@ class Detector:
                     self.weapon.flush_track((cam_id, hit.person_track))
         return out
 
+    # ── Face recognition: burst-of-N capture per person arrival, then idle ───
+    def _face_pass(self, staged: list) -> dict[int, list]:
+        """Returns {cam_id: [FaceHit, ...]}. Empty dict when disabled.
+
+        Mirrors _vehicle_pass's event-triggered shape, but the "arrival" here
+        is a bounded BURST (ibvap/face_events.PersonArrivalTracker) rather than
+        one shot + open-ended follow-ups: up to face.burst_n face-bearing
+        readings are collected per person track, then the burst is decided by
+        majority vote and the track goes idle — no further GPU work for it
+        until it disappears and a different track_id genuinely arrives."""
+        if self.face is None:
+            return {}
+        now = time.time()
+        due_by_cam: list[tuple[int, np.ndarray, list]] = []
+
+        # New capture attempts are paced to every Nth detection pass
+        # (face.detect_every) to spread GPU cost when several people arrive at
+        # once — but reading back an already-finalized match (below) always
+        # runs, every pass, so a confirmed match's box/banner never flickers
+        # on a tick this gate skips.
+        self._face_passes += 1
+        if self._face_passes % self._face_detect_every == 0:
+            for cam_id, ts, frame, dets in staged:
+                persons = [d for d in dets if d.is_person and d.track_id >= 0]
+                if not persons:
+                    continue
+                due = [d for d in persons
+                      if self._face_arrival.wants_capture((cam_id, d.track_id), self._tick, now)]
+                if not due:
+                    continue
+                native = self._native_for(cam_id, ts) if self._face_use_native else None
+                src = native if native is not None else frame
+                due_by_cam.append((cam_id, src, [(*d.bbox, d.track_id) for d in due]))
+
+        hits_by_cam = self.face.identify_batch(due_by_cam) if due_by_cam else {}
+
+        for cam_id, src, persons in due_by_cam:
+            hit_by_track = {h.person_track: h for h in hits_by_cam.get(cam_id, [])}
+            for x1, y1, x2, y2, tid in persons:
+                key = (cam_id, tid)
+                hit = hit_by_track.get(tid)
+                if hit is not None:
+                    seq = self._face_arrival.attempts_so_far(key)
+                    self.face_results.capture_snapshot(
+                        cam_id, src, tid, seq,
+                        {"detail": hit.matched_name or ""}, now)
+                verdict = self._face_arrival.record(key, now, hit)
+                if verdict is not None:
+                    rec = self.face_results.finalize(cam_id, tid, verdict, now)
+                    if rec is not None:
+                        self._face_arrivals.append(rec)
+
+        # Read back matched identity onto live Detections (only once a burst
+        # has actually finalized to "on watchlist" — never an in-progress
+        # guess), and keep the box/banner alive for hit_ttl_s between bursts
+        # via fresh_hit() on tracks that weren't due this tick.
+        faces_by_cam: dict[int, list] = {}
+        for cam_id, _ts, _frame, dets in staged:
+            out = list(hits_by_cam.get(cam_id, []))
+            have = {h.person_track for h in out}
+            for d in dets:
+                if not (d.is_person and d.track_id >= 0) or d.track_id in have:
+                    continue
+                fresh = self._face_arrival.fresh_hit((cam_id, d.track_id), now)
+                if fresh is not None:
+                    out.append(fresh)
+            faces_by_cam[cam_id] = out
+            hit_by_track = {h.person_track: h for h in out}
+            for d in dets:
+                if not d.is_person:
+                    continue
+                h = hit_by_track.get(d.track_id)
+                if h is not None and h.on_watchlist:
+                    d.face_name, d.face_conf, d.on_watchlist = (
+                        h.matched_name, h.similarity, True)
+
+        for cam_id, _ts, _frame, dets in staged:
+            live = {d.track_id for d in dets if d.is_person and d.track_id >= 0}
+            self._face_arrival.prune(cam_id, live)
+        return faces_by_cam
+
+    def drain_face_arrivals(self) -> list[dict]:
+        """Finalized face-burst records (matched or "unknown") since the last
+        call — server.py files each to data/face_results/ and hash-chains a
+        confirmed watchlist match into evidence."""
+        out, self._face_arrivals = self._face_arrivals, []
+        return out
+
     # ── Carrying tracks between detector passes ──────────────────────────────
     def _carry_forward(self, cam_id: int, ts: float, frame: np.ndarray) -> StreamResult:
         """Advance known boxes by their velocity — no GPU work at all."""
@@ -854,6 +984,7 @@ class Detector:
                 posture=d.posture,   # carry last known pose — dimmed in draw_skeleton
                 plate=d.plate, plate_conf=d.plate_conf,
                 vehicle_type=d.vehicle_type, vehicle_type_conf=d.vehicle_type_conf,
+                face_name=d.face_name, face_conf=d.face_conf, on_watchlist=d.on_watchlist,
             ))
 
         return StreamResult(
@@ -864,7 +995,8 @@ class Detector:
 
     # ── Drawing ──────────────────────────────────────────────────────────────
     def _annotate(self, frame: np.ndarray, detections: list[Detection],
-                  dim: bool = False, weapons: list | None = None) -> np.ndarray:
+                  dim: bool = False, weapons: list | None = None,
+                  faces: list | None = None) -> np.ndarray:
         canvas = frame.copy()
         for d in detections:
             x1, y1, x2, y2 = d.bbox
@@ -914,6 +1046,24 @@ class Detector:
             gy = max(wy1 - 4, gh + 4)
             cv2.rectangle(canvas, (wx1, gy - gh - 4), (wx1 + gw + 8, gy + 2), wcol, -1)
             cv2.putText(canvas, wlabel, (wx1 + 4, gy - 1),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # Face boxes: bright red + name when on the watchlist, faint cyan
+        # "checked" tick otherwise — so an operator sees a face was looked at
+        # even when it didn't match anyone.
+        for fh in (faces or []):
+            fx1, fy1, fx2, fy2 = fh.bbox
+            if fh.on_watchlist:
+                fcol, thick = (0, 0, 255), 3
+                flabel = f"{fh.matched_name or '?'} {fh.similarity:.0%}"
+            else:
+                fcol, thick = (200, 160, 60), 1
+                flabel = "face checked"
+            cv2.rectangle(canvas, (fx1, fy1), (fx2, fy2), fcol, thick)
+            (fw_, fh_), _ = cv2.getTextSize(flabel, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+            fy = max(fy1 - 4, fh_ + 4)
+            cv2.rectangle(canvas, (fx1, fy - fh_ - 4), (fx1 + fw_ + 8, fy + 2), fcol, -1)
+            cv2.putText(canvas, flabel, (fx1 + 4, fy - 1),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         return canvas
 

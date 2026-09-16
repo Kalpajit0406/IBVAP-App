@@ -264,6 +264,9 @@ class AppState extends ChangeNotifier {
       final anprResults = await _client.anprResults(limit: 20);
       if (gen != _generation) return;
       alerts.ingestAnprResults(anprResults);
+      final faceResults = await _client.faceResults(limit: 20);
+      if (gen != _generation) return;
+      alerts.ingestFaceResults(faceResults);
       notifyListeners();
     } catch (_) {
       // non-fatal — the /status poll owns the link state

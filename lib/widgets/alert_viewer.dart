@@ -6,10 +6,13 @@ import '../theme.dart';
 
 class AlertViewer {
   /// AlertKind.anpr thumbnails come from data/anpr_results/ (/anpr_snap/),
-  /// every other kind from data/snapshots/ (/snap/).
-  static Uri thumbUrl(AppState state, AlertEntry e) => e.kind == AlertKind.anpr
-      ? state.client.anprSnapUrl(e.thumbFile!)
-      : state.client.snapshotUrl(e.thumbFile!);
+  /// AlertKind.face from data/face_results/ (/face_snap/), every other kind
+  /// from data/snapshots/ (/snap/).
+  static Uri thumbUrl(AppState state, AlertEntry e) => switch (e.kind) {
+        AlertKind.anpr => state.client.anprSnapUrl(e.thumbFile!),
+        AlertKind.face => state.client.faceSnapUrl(e.thumbFile!),
+        _ => state.client.snapshotUrl(e.thumbFile!),
+      };
 
   static Future<void> show(BuildContext context, AppState state, AlertEntry e) {
     return showDialog<void>(

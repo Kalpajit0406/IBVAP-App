@@ -17,6 +17,8 @@ class RiskAssessment:
     weapon: bool = False       # a weapon threat (AIM posture OR a confirmed gun) this frame
     armed: bool = False        # AIM posture AND a confirmed gun on the SAME track
     weapon_tier: str = ""      # "armed" | "gun" | "posture" | ""  — drives the dashboard banner
+    criminal_match: bool = False   # a face on the watchlist gallery was burst-confirmed this frame
+    criminal_name: str = ""        # display name of the matched identity
 
 
 class RiskEngine:
@@ -90,8 +92,44 @@ class RiskEngine:
         else:
             tier = ""
 
+        # ── Watchlist face match → Critical, independent of and composable
+        # with the weapon override above. This is deliberately NOT a
+        # reopening of risk.score_can_reach_critical (which stays false —
+        # generic person presence still tops out at High): a burst-confirmed
+        # match against a curated, operator-enrolled watchlist gallery
+        # (ibvap/face.py, ibvap/face_events.py) is a named-identity signal,
+        # the same category of override as a confirmed weapon or a fence
+        # breach, not "a person was detected". If BOTH a weapon and a
+        # watchlist face are present this frame, max() below only ever raises
+        # the score — the weapon branch's own level/score (already Critical)
+        # is preserved, never downgraded.
+        watchlist_hits = {
+            h.person_track: (h.matched_name or "")
+            for h in (getattr(sr, "faces", None) or [])
+            if getattr(h, "on_watchlist", False) and getattr(h, "person_track", -1) >= 0
+        }
+        # sr.faces is only populated on frames the detector actually inferred;
+        # Detector._carry_forward advances boxes between passes WITHOUT it, but
+        # does carry each track's on_watchlist/face_name forward. Reading those
+        # too keeps criminal_match as steady as the labelled box already is —
+        # otherwise the flag (and so the dashboard banner and the app's
+        # rising-edge "CRIMINAL SPOTTED" alert) strobes on and off at the
+        # detection cadence while the matched person is standing right there,
+        # re-firing the alarm on every carried frame.
+        for d in (getattr(sr, "detections", None) or []):
+            if getattr(d, "on_watchlist", False) and getattr(d, "track_id", -1) >= 0:
+                watchlist_hits.setdefault(d.track_id, getattr(d, "face_name", "") or "")
+        criminal_match = bool(watchlist_hits)
+        criminal_name = next(iter(watchlist_hits.values()), "")
+        if criminal_match:
+            level = "Critical"
+            score = max(score, 96.0)   # between "gun" (94) and "armed" (99): a
+                                        # named threat is grave; a confirmed
+                                        # weapon on the same frame is graver
+                                        # still and wins via max() above
+
         return RiskAssessment(sr.cam_id, score, level, zone, tod, beh,
-                              weapon, armed, tier)
+                              weapon, armed, tier, criminal_match, criminal_name)
 
     # ── Component scorers ─────────────────────────────────────────────────────
 

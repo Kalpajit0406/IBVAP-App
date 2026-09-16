@@ -10,6 +10,7 @@ import '../widgets/server_dialog.dart';
 import 'monitor_screen.dart';
 import 'panels/anpr_results_panel.dart';
 import 'panels/evidence_panel.dart';
+import 'panels/faces_panel.dart';
 import 'panels/models_panel.dart';
 import 'panels/overview_panel.dart';
 import 'panels/settings_panel.dart';
@@ -49,6 +50,7 @@ class _HomeScreenState extends State<HomeScreen> {
     (icon: Icons.psychology_outlined, label: 'Models'),
     (icon: Icons.photo_library_outlined, label: 'Snapshots'),
     (icon: Icons.directions_car_filled_outlined, label: 'ANPR'),
+    (icon: Icons.face_retouching_natural, label: 'Faces'),
     (icon: Icons.verified_user_outlined, label: 'Evidence'),
     (icon: Icons.settings_outlined, label: 'Settings'),
   ];
@@ -63,8 +65,9 @@ class _HomeScreenState extends State<HomeScreen> {
       3 => padded(ModelsPanel(state: s, key: const ValueKey('models'))),
       4 => padded(SnapshotsPanel(state: s, key: const ValueKey('snapshots'))),
       5 => padded(AnprResultsPanel(state: s, key: const ValueKey('anpr'))),
-      6 => padded(EvidencePanel(state: s, key: const ValueKey('evidence'))),
-      7 => padded(SettingsPanel(state: s, key: const ValueKey('settings'))),
+      6 => padded(FacesPanel(state: s, key: const ValueKey('faces'))),
+      7 => padded(EvidencePanel(state: s, key: const ValueKey('evidence'))),
+      8 => padded(SettingsPanel(state: s, key: const ValueKey('settings'))),
       _ => const SizedBox.shrink(),
     };
   }

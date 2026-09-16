@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../theme.dart';
 
-enum AlertKind { risk, breach, plate, weapon, posture, snapshot, anpr }
+enum AlertKind { risk, breach, plate, weapon, posture, snapshot, anpr, face }
 
 /// How loudly an entry is signalled. Only [critical] raises the console alarm
 /// and demands acknowledgement.
@@ -33,7 +33,7 @@ class AlertEntry {
   final String detail;
   final DateTime at;
   final String? thumbFile; // "<cam>/<name>.jpg" — /snap/ for every kind except
-                           // AlertKind.anpr, which serves from /anpr_snap/
+                           // AlertKind.anpr (/anpr_snap/) and AlertKind.face (/face_snap/)
   final String? vehicleType;     // AlertKind.anpr only
   final double? vehicleTypeConf; // AlertKind.anpr only
 
@@ -54,6 +54,9 @@ class AlertEntry {
         AlertKind.plate => IbvapColors.plate,
         AlertKind.snapshot => IbvapColors.blue,
         AlertKind.anpr => IbvapColors.blue,
+        AlertKind.face => severity == AlertSeverity.critical
+            ? IbvapColors.red
+            : IbvapColors.blue,
         AlertKind.risk => severity == AlertSeverity.critical
             ? IbvapColors.red
             : IbvapColors.orange,
@@ -66,6 +69,7 @@ class AlertEntry {
         AlertKind.plate => Icons.pin_outlined,
         AlertKind.snapshot => Icons.photo_camera_outlined,
         AlertKind.anpr => Icons.local_shipping_outlined,
+        AlertKind.face => Icons.face_retouching_natural,
         AlertKind.risk => Icons.warning_amber_rounded,
       };
 }

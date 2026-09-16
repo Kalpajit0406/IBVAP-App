@@ -371,7 +371,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
                   Text('KEYBOARD', style: IbvapText.label(size: 9.5)),
                   const SizedBox(height: 6),
                   for (final (k, v) in const [
-                    ('Ctrl+1 .. Ctrl+8', 'Switch view'),
+                    ('Ctrl+1 .. Ctrl+9', 'Switch view'),
                     ('Ctrl+K', 'Acknowledge newest alarm'),
                     ('Ctrl+Shift+K', 'Acknowledge all alarms'),
                     ('F5', 'Refresh now'),

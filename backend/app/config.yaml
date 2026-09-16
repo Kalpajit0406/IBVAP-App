@@ -357,6 +357,74 @@ weapon:
   classes: ["gun"]
 
 
+# ── Face recognition / criminal watchlist ───────────────────────────────────
+# When a person is tracked, IBVAP tries to capture their face and checks it
+# against a small curated gallery of known identities (ibvap/face.py
+# FaceEngine, insightface buffalo_l: RetinaFace detect + ArcFace embed) — the
+# same detect -> embed -> nearest-neighbour shape as an attendance kiosk, run
+# against a WATCHLIST instead of an allow-list. This is deliberately NOT the
+# same thing as "a person was detected": risk.score_can_reach_critical stays
+# false, and a person with no face match still tops out at High. A confirmed
+# watchlist match is a separate, explicit override (ibvap/risk_engine.py), the
+# same shape as the weapon/gun override and a virtual-fence breach.
+#
+# Up to burst_n face-bearing frames are collected per person arrival
+# (ibvap/face_events.py PersonArrivalTracker); the burst is decided by
+# majority vote — vote_min of the (<=burst_n) readings must agree on the same
+# identity, each individually past match_threshold, or the arrival is
+# "unknown". A single lucky/adversarial frame is never enough on its own.
+#
+# The gallery (models/face/gallery.json) is built by enrollment, NOT training:
+#   python training/enroll_faces.py      # reads models/face/gallery_photos/<identity>/
+# If the gallery, the two committed ONNX weights (models/face/models/ibvap_face/),
+# or the insightface package are missing, the engine disables itself and the
+# pipeline is unaffected. See docs/FACE_RECOGNITION.md.
+face:
+  enabled: true
+  gallery: "models/face/gallery.json"        # embeddings + names, written by training/enroll_faces.py
+  model_root: "models/face"                  # contains models/<pack_name>/*.onnx (insightface layout)
+  pack_name: "ibvap_face"                    # committed buffalo_l det+rec weights, see docs/FACE_RECOGNITION.md
+  dataset_root: "E:/Projects/ibvap-datasets"   # downloaded datasets live OUTSIDE the repo
+  det_size: 320               # insightface detector input side (px) — a padded person-box
+                               # crop, not a full frame, so this stays small and cheap
+  det_score_min: 0.55         # discard a detected face below this confidence
+  # ArcFace embeddings are trained with an angular margin (m=0.5); published
+  # verification setups for this family typically use ~0.30-0.45 cosine similarity
+  # for a low-false-accept operating point. 0.38 favours precision deliberately —
+  # a false "Criminal spotted" is far worse than one missed frame.
+  match_threshold: 0.38
+  burst_n: 5                   # how many face-bearing frames to collect per person arrival
+  vote_min: 3                  # >= this many of the (up to burst_n) readings must agree on the
+                               # same identity, each >= match_threshold, to call it a match —
+                               # a single lucky frame is not enough (mirrors weapon.hold_hits)
+  max_attempts: 15             # give up on this arrival after this many detection ticks even
+                               # if fewer than burst_n faces were ever found (person never faces camera)
+  attempt_window_s: 8.0        # ... or after this many seconds, whichever comes first
+  hit_ttl_s: 4.0                # keep drawing/alerting a finalized match this long between bursts
+  detect_every: 2               # new capture attempts run every Nth detection pass (spreads GPU
+                                 # cost when several people arrive at once); reading back an
+                                 # already-finalized match happens every pass regardless, so a
+                                 # confirmed match's box/banner never flickers on a skipped tick
+  crop_pad_frac: 0.25            # pad the person box this much before cropping for face detection —
+                                 # a tight person box often clips the top of the head/chin
+  use_native_frame: true         # prefer the camera's native-resolution frame for the crop when
+                                 # available (Detector._native_for), same as ANPR/vehicle-type snapshots
+  max_persons_per_pass: 8        # cap crops sent to the face model per camera per pass (mirrors pose.max_persons)
+
+# One picture-burst + one JSON record per person arrival, under
+# data/face_results/<cam_id>/ — deliberately separate from data/snapshots/
+# (breach/weapon/posture) and from data/anpr_results/, same reasoning as ANPR:
+# a face arrival's own metadata (matched identity, similarity, vote count, a
+# multi-file burst) doesn't fit either of those record shapes.
+face_results:
+  enabled: true
+  dir: "data/face_results"
+  jpeg_quality: 90
+  # Every finalized arrival is filed (including "unknown") — only a confirmed
+  # watchlist match is also hash-chained into evidence.
+  log_to_evidence: true
+
+
 # ── Risk scoring ──────────────────────────────────────────────────────────────
 risk:
   threshold_critical: 70   # only used when score_can_reach_critical is true

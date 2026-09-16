@@ -175,6 +175,11 @@ async def _lifespan(app: FastAPI):
                 _detector.weapon.stop()
             except Exception:
                 pass
+        if _detector is not None and getattr(_detector, "face", None) is not None:
+            try:
+                _detector.face.stop()
+            except Exception:
+                pass
         if _harvester is not None:
             try:
                 _harvester.stop()
@@ -1215,6 +1220,100 @@ async def list_anpr_results(cam_id: int | None = None, limit: int = 30):
     return JSONResponse({"results": out[:limit]})
 
 
+# ── Face-recognition results + watchlist gallery ────────────────────────────
+# A small burst of pictures + one JSON record per person arrival (matched
+# identity or "unknown"), written by ibvap/face_events.py to
+# data/face_results/<cam_id>/ — deliberately separate from data/snapshots/ and
+# data/anpr_results/. Read-only here; the console shows the thumbnails. The
+# gallery itself (models/face/gallery.json) is also read-only via the API —
+# enrolling a new watchlist identity is training/enroll_faces.py + a restart
+# or hot-swap, not an in-console upload (see docs/FACE_RECOGNITION.md).
+def _face_results_dir() -> Path:
+    return Path(cfg.get("face_results", {}).get("dir", "data/face_results"))
+
+
+@app.get("/face_snap/{cam_id}/{name}")
+async def face_snap_file(cam_id: int, name: str):
+    if not _SNAP_NAME.match(name):
+        return Response(status_code=404)
+    base = (_face_results_dir() / str(cam_id)).resolve()
+    p = (base / name).resolve()
+    try:
+        p.relative_to(base)
+    except ValueError:
+        return Response(status_code=404)
+    if not p.is_file():
+        return Response(status_code=404)
+    return Response(content=p.read_bytes(), media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/api/face/results")
+async def list_face_results(cam_id: int | None = None, limit: int = 30):
+    limit = max(1, min(int(limit), 200))
+    root = _face_results_dir()
+    if cam_id is not None:
+        cams = [cam_id]
+    else:
+        cams = sorted(int(p.name) for p in root.glob("*")
+                      if p.is_dir() and p.name.isdigit()) if root.exists() else []
+    out: list = []
+    for c in cams:
+        idx = root / str(c) / "index.jsonl"
+        if not idx.exists():
+            continue
+        try:
+            lines = idx.read_text("utf-8").splitlines()[-limit:]
+        except OSError:
+            continue
+        for ln in lines:
+            try:
+                out.append(json.loads(ln))
+            except ValueError:
+                pass
+    out.sort(key=lambda r: r.get("ts", 0), reverse=True)
+    return JSONResponse({"results": out[:limit]})
+
+
+@app.get("/api/face/gallery")
+async def list_face_gallery():
+    """Read-only listing of enrolled watchlist identities. Enrolling a new one
+    is `python training/enroll_faces.py` + a restart/hot-swap — not built as
+    an in-console upload this pass (docs/FACE_RECOGNITION.md)."""
+    p = Path(cfg.get("face", {}).get("gallery", "models/face/gallery.json"))
+    if not p.is_file():
+        return JSONResponse({"identities": []})
+    try:
+        gal = json.loads(p.read_text("utf-8"))
+    except ValueError:
+        return JSONResponse({"identities": []})
+    return JSONResponse({
+        "identities": [
+            {"id": g["id"], "name": g.get("name", g["id"]), "n_photos": g.get("n_photos", 0),
+             "thumb": f"/face_gallery_thumb/{g['id']}.jpg"}
+            for g in gal.get("identities", []) if "id" in g
+        ],
+        "match_threshold": gal.get("match_threshold"),
+        "created": gal.get("created"),
+    })
+
+
+@app.get("/face_gallery_thumb/{name}")
+async def face_gallery_thumb(name: str):
+    if not _SNAP_NAME.match(name):
+        return Response(status_code=404)
+    base = (Path(cfg.get("face", {}).get("model_root", "models/face")) / "thumbs").resolve()
+    p = (base / name).resolve()
+    try:
+        p.relative_to(base)
+    except ValueError:
+        return Response(status_code=404)
+    if not p.is_file():
+        return Response(status_code=404)
+    return Response(content=p.read_bytes(), media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
 # ── Continuous learning ─────────────────────────────────────────────────────
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _LEARN_ID = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
@@ -1420,6 +1519,12 @@ async def status():
         "weapon": (_detector.weapon.status()
                    if _detector is not None and getattr(_detector, "weapon", None)
                    else {"enabled": False}),
+        "face": (_detector.face.status()
+                 if _detector is not None and getattr(_detector, "face", None)
+                 else {"enabled": False}),
+        "face_results": (_detector.face_results.status()
+                         if _detector is not None and getattr(_detector, "face_results", None)
+                         else {"enabled": False}),
         "input_mode": _STARTUP_MODE,
         "geofence": {
             "enabled": bool(cfg.get("geofence", {}).get("enabled")),
@@ -1641,7 +1746,10 @@ def _inference_worker() -> None:
                         vehicle_type=getattr(old_det, "vehicle_type", None),
                         anpr_results=getattr(old_det, "anpr_results", None),
                         vehicle_arrival=getattr(old_det, "_vehicle_arrival", None),
-                        native_frame_fn=getattr(old_det, "_native_frame_fn", None))
+                        native_frame_fn=getattr(old_det, "_native_frame_fn", None),
+                        face=getattr(old_det, "face", None),
+                        face_arrival=getattr(old_det, "_face_arrival", None),
+                        face_results=getattr(old_det, "face_results", None))
                     _stats["active_model"] = item.get("name", "ft")
                 else:
                     new_det = Detector.from_profile(
@@ -1651,7 +1759,10 @@ def _inference_worker() -> None:
                         vehicle_type=getattr(old_det, "vehicle_type", None),
                         anpr_results=getattr(old_det, "anpr_results", None),
                         vehicle_arrival=getattr(old_det, "_vehicle_arrival", None),
-                        native_frame_fn=getattr(old_det, "_native_frame_fn", None))
+                        native_frame_fn=getattr(old_det, "_native_frame_fn", None),
+                        face=getattr(old_det, "face", None),
+                        face_arrival=getattr(old_det, "_face_arrival", None),
+                        face_results=getattr(old_det, "face_results", None))
                     _stats["active_model"] = item
                 detector = new_det
                 _detector = detector
@@ -1782,6 +1893,13 @@ def _inference_worker() -> None:
                     "gun":     "GUN DETECTED  -  CRITICAL",
                     "posture": "WEAPON (posture)  -  CRITICAL",
                 }.get(ra.weapon_tier, "WEAPON  -  CRITICAL"))
+            if ra.criminal_match:
+                # Stack below the weapon banner rather than over it when both
+                # fire on the same frame, so neither is hidden.
+                band = (0.60, 0.74) if ra.weapon else (0.42, 0.58)
+                _draw_banner(frame_out,
+                            f"CRIMINAL SPOTTED: {ra.criminal_name or 'UNKNOWN'}  -  CRITICAL",
+                            band=band)
             _latest_bgr[sr.cam_id] = frame_out
             raw_by_cam[sr.cam_id] = sr.frame
 
@@ -1879,6 +1997,12 @@ def _inference_worker() -> None:
                 ],
                 "breach": breach_now,
                 "breach_zones": breach_zones,
+                "criminal_match": ra.criminal_match,
+                "criminal_name": ra.criminal_name,
+                "face_boxes": [
+                    [*h.bbox, h.matched_name or "", round(h.similarity, 2), bool(h.on_watchlist)]
+                    for h in (sr.faces or [])
+                ],
             }
 
         # Confirmed number plates → the hash-chained evidence log, and — the
@@ -1947,6 +2071,35 @@ def _inference_worker() -> None:
                 logger.warning("CAM-%02d GUN CONFIRMED  track=%d  conf=%.0f%%  hash=%s...",
                                we.cam_id, we.track_id, we.conf * 100, h[:12])
 
+        # ── Face recognition: every finalized burst (matched or "unknown") is
+        #    filed to data/face_results/ for the audit trail; only a confirmed
+        #    watchlist match is also hash-chained into evidence, mirroring
+        #    weapon's "confirmed only" — same shape as the block above. ───────
+        if getattr(detector, "face", None) is not None:
+            recs = detector.drain_face_arrivals()
+            if getattr(detector, "face_results", None) is not None:
+                recs += detector.face_results.sweep_timeouts()
+            for rec in recs:
+                if rec.get("on_watchlist") and detector.face_results is not None \
+                        and detector.face_results.log_to_evidence:
+                    files = rec.get("files") or []
+                    shas = rec.get("sha256s") or []
+                    ev = {"cam_id": rec["cam_id"], "type": "face_match",
+                          "matched_id": rec.get("matched_id"),
+                          "matched_name": rec.get("matched_name"),
+                          "similarity": rec.get("similarity"), "votes": rec.get("votes"),
+                          "of": rec.get("of"), "track": rec["track_id"],
+                          "evidence_file": files[0] if files else None,
+                          "sha256": shas[0] if shas else None}
+                    h = evidence.append(ev)
+                    rec["ev_hash"] = h
+                    store.log(rec["cam_id"], "Critical", 96.0, 0, 0, ev, h)
+                    logger.warning("CAM-%02d CRIMINAL SPOTTED  name=%s  track=%d  sim=%.2f  hash=%s...",
+                                   rec["cam_id"], rec.get("matched_name"), rec["track_id"],
+                                   rec.get("similarity", 0.0), h[:12])
+                if getattr(detector, "face_results", None) is not None:
+                    detector.face_results.record(rec)
+
 
 def _draw_label(img, text: str, org, scale: float, colour) -> None:
     """Text with a black outline so it reads on any background."""
@@ -1956,10 +2109,12 @@ def _draw_label(img, text: str, org, scale: float, colour) -> None:
                 colour, 1, cv2.LINE_AA)
 
 
-def _draw_banner(img, text: str) -> None:
-    """A full-width red alert bar across the middle of the frame."""
+def _draw_banner(img, text: str, band: tuple[float, float] = (0.42, 0.58)) -> None:
+    """A full-width red alert bar across the frame at the given vertical band
+    (fraction of height) — a second banner can stack below the first when a
+    weapon and a watchlist match are both active on the same frame."""
     h, w = img.shape[:2]
-    y0, y1 = int(h * 0.42), int(h * 0.58)
+    y0, y1 = int(h * band[0]), int(h * band[1])
     strip = img[y0:y1].copy()
     cv2.rectangle(strip, (0, 0), (w, y1 - y0), (0, 0, 200), -1)
     cv2.addWeighted(strip, 0.55, img[y0:y1], 0.45, 0, img[y0:y1])

@@ -62,6 +62,24 @@ class IbvapClient {
     return (j['results'] as List<dynamic>?) ?? const [];
   }
 
+  /// Event-triggered face-recognition results: a small burst of pictures +
+  /// the matched identity (or "unknown") per person arrival, from
+  /// data/face_results/ (separate from /api/snapshots and /api/anpr/results).
+  Future<List<dynamic>> faceResults({int? camId, int limit = 30}) async {
+    final q = StringBuffer('/api/face/results?limit=$limit');
+    if (camId != null) q.write('&cam_id=$camId');
+    final j = await _getJson(q.toString());
+    return (j['results'] as List<dynamic>?) ?? const [];
+  }
+
+  /// Read-only watchlist gallery listing (name, photo count, thumbnail).
+  /// Enrolling a new identity is `training/enroll_faces.py` + a restart/
+  /// hot-swap, not an in-console upload — see docs/FACE_RECOGNITION.md.
+  Future<List<dynamic>> faceGallery() async {
+    final j = await _getJson('/api/face/gallery');
+    return (j['identities'] as List<dynamic>?) ?? const [];
+  }
+
   Future<Map<String, dynamic>> learnPool({String? status}) {
     final p =
         status == null ? '/api/learn/pool' : '/api/learn/pool?status=$status';
@@ -173,6 +191,13 @@ class IbvapClient {
   /// An ANPR-result JPEG. [file] is the `file` value from
   /// `/api/anpr/results` (already `"<cam_id>/<name>.jpg"`).
   Uri anprSnapUrl(String file) => _cfg.endpoint('/anpr_snap/$file');
+
+  /// A face-result JPEG. [file] is one entry of the `files` list from
+  /// `/api/face/results` (already `"<cam_id>/<name>.jpg"`).
+  Uri faceSnapUrl(String file) => _cfg.endpoint('/face_snap/$file');
+
+  /// A watchlist gallery identity's enrollment thumbnail.
+  Uri faceGalleryThumbUrl(String id) => _cfg.endpoint('/face_gallery_thumb/$id.jpg');
 
   // ── plumbing ────────────────────────────────────────────────────────────
   Map<String, String> _headers({bool json = false}) {

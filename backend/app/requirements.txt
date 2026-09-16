@@ -42,6 +42,18 @@ easyocr>=1.7.0                    # OCR fallback
 # Training only (Kaggle notebook / training/train_anpr.py):
 #   pip install "fast-plate-ocr[train]"   kaggle   roboflow
 
+# Face recognition / criminal watchlist (ibvap/face.py, face.enabled in
+# config.yaml). insightface FaceAnalysis: RetinaFace detect + ArcFace embed,
+# buffalo_l pack — rides the same onnxruntime-gpu CUDA EP already pinned above
+# via fast-plate-ocr[onnx-gpu]. The gallery (models/face/gallery.json) is built
+# by enrollment, not training: python training/enroll_faces.py. Pretrained
+# buffalo_l weights are InsightFace's own non-commercial-research license —
+# fine for this demo, note if ever productionised commercially. First run
+# needs internet to auto-download the pack once; then copy the two .onnx
+# files into models/face/models/ibvap_face/ (already committed in this repo)
+# for fully offline operation — see docs/FACE_RECOGNITION.md.
+insightface==0.7.3
+
 # TensorRT engine export (export_engine.py) — the pipeline default is
 # yolo26n.engine. GPU only. Pin to 10.x: 11.x removed the builder API
 # Ultralytics 8.4 uses. cu12 must match torch's cu126.

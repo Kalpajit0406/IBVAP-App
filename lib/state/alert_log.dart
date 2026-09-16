@@ -19,15 +19,18 @@ class AlertLog extends ChangeNotifier {
   final Map<int, bool> _lastBreach = {};
   final Map<int, bool> _lastWeapon = {};
   final Map<int, bool> _lastAim = {};
+  final Map<int, bool> _lastFace = {};
   final _seenPlates = _BoundedSet(600);
   final _seenSnaps = _BoundedSet(1200);
   final _seenAnpr = _BoundedSet(1200);
+  final _seenFace = _BoundedSet(1200);
 
-  // The first snapshot / ANPR poll returns records that already existed when
-  // the console connected. They belong in the log as history, but must not
-  // raise alarms for events the operator never missed.
+  // The first snapshot / ANPR / face poll returns records that already
+  // existed when the console connected. They belong in the log as history,
+  // but must not raise alarms for events the operator never missed.
   bool _snapsPrimed = false;
   bool _anprPrimed = false;
+  bool _facePrimed = false;
 
   int _seq = 0;
 
@@ -69,11 +72,14 @@ class AlertLog extends ChangeNotifier {
     _lastBreach.clear();
     _lastWeapon.clear();
     _lastAim.clear();
+    _lastFace.clear();
     _seenPlates.clear();
     _seenSnaps.clear();
     _seenAnpr.clear();
+    _seenFace.clear();
     _snapsPrimed = false;
     _anprPrimed = false;
+    _facePrimed = false;
     notifyListeners();
   }
 
@@ -151,6 +157,25 @@ class AlertLog extends ChangeNotifier {
         changed = true;
       }
       _lastAim[camId] = aim;
+
+      // Burst-confirmed watchlist face match — a named-identity signal, the
+      // same override category as breach/weapon, never a generic "person
+      // detected" alarm (see ibvap/risk_engine.py's criminal_match branch).
+      final criminal = m['criminal_match'] == true;
+      if (criminal && !(_lastFace[camId] ?? false)) {
+        final name = (m['criminal_name'] ?? '').toString();
+        _add(AlertEntry(
+          id: ++_seq,
+          kind: AlertKind.face,
+          severity: AlertSeverity.critical,
+          camId: camId,
+          title: 'CRIMINAL SPOTTED',
+          detail: name.isEmpty ? 'watchlist match' : name,
+          at: now,
+        ));
+        changed = true;
+      }
+      _lastFace[camId] = criminal;
     }
 
     // Plates surfaced by ANPR (status.anpr.active[]).
@@ -242,6 +267,42 @@ class AlertLog extends ChangeNotifier {
         thumbFile: (m['file'])?.toString(),
         vehicleType: vType,
         vehicleTypeConf: (m['vehicle_type_conf'] as num?)?.toDouble(),
+        historical: historical,
+      ));
+      changed = true;
+    }
+    if (changed) notifyListeners();
+  }
+
+  /// Event-triggered face-recognition results (one row per person arrival's
+  /// finalized burst — matched identity or "unknown"). The live Critical
+  /// alarm already fired from ingestStatus's edge above, so this polled
+  /// history feed never re-alarms — same convention ingestSnapshots uses.
+  void ingestFaceResults(List<dynamic> rows) {
+    final historical = !_facePrimed;
+    _facePrimed = true;
+    var changed = false;
+    for (final r in rows.reversed.whereType<Map>()) {
+      final m = r.cast<String, dynamic>();
+      final ts = _num(m['ts']);
+      final cam = (m['cam_id'] as num?)?.toInt() ?? 0;
+      if (!_seenFace.add('$cam|$ts|${m['track_id']}')) continue;
+      final onWatchlist = m['on_watchlist'] == true;
+      final name = (m['matched_name'] as String?);
+      final files = (m['files'] as List?) ?? const [];
+      final votes = (m['votes'] as num?)?.toInt() ?? 0;
+      final of = (m['of'] as num?)?.toInt() ?? 0;
+      _add(AlertEntry(
+        id: ++_seq,
+        kind: AlertKind.face,
+        severity: AlertSeverity.info,
+        camId: cam,
+        title: onWatchlist ? 'CRIMINAL SPOTTED (logged)' : 'FACE CHECKED',
+        detail: onWatchlist
+            ? (name?.isNotEmpty == true ? name! : 'watchlist match')
+            : (of == 0 ? 'no face found' : '$votes/$of unmatched'),
+        at: DateTime.fromMillisecondsSinceEpoch((ts * 1000).round()),
+        thumbFile: files.isNotEmpty ? files.first.toString() : null,
         historical: historical,
       ));
       changed = true;

@@ -20,7 +20,7 @@ import 'package:ibvap_app/theme.dart';
 import 'package:ibvap_app/util/describe_error.dart';
 
 const _labels = [
-  'MONITOR', 'OVERVIEW', 'CAMERAS', 'MODELS', 'SNAPSHOTS', 'ANPR', 'EVIDENCE', 'SETTINGS'
+  'MONITOR', 'OVERVIEW', 'CAMERAS', 'MODELS', 'SNAPSHOTS', 'ANPR', 'FACES', 'EVIDENCE', 'SETTINGS'
 ];
 
 Map<String, dynamic> _status({
@@ -181,6 +181,36 @@ void main() {
       expect(log.unackedCount, 0);
       expect(log.entries.map((e) => e.title), containsAll(['HIGH', 'AIM POSTURE']));
       expect(log.entries.every((e) => e.severity == AlertSeverity.warning), isTrue);
+    });
+
+    test('a burst-confirmed criminal match alarms once per rising edge', () {
+      final log = AlertLog();
+      final hit = ServerStatus(_status(
+          meta: {'0': {'criminal_match': true, 'criminal_name': 'Alice'}}));
+      log.ingestStatus(hit);
+      log.ingestStatus(hit); // still matched: no second alarm
+      expect(log.unackedCount, 1);
+      expect(log.entries.first.kind, AlertKind.face);
+      expect(log.entries.first.title, 'CRIMINAL SPOTTED');
+      expect(log.entries.first.detail, 'Alice');
+      log.ingestStatus(ServerStatus(_status(meta: {'0': {'criminal_match': false}})));
+      log.ingestStatus(hit); // new crossing
+      expect(log.unackedCount, 2);
+    });
+
+    test('face results poll never alarms — the live edge above already did', () {
+      final log = AlertLog();
+      log.ingestFaceResults([
+        {'ts': 1.0, 'cam_id': 0, 'track_id': 1, 'on_watchlist': true,
+          'matched_name': 'Alice', 'files': ['0/a.jpg'], 'votes': 3, 'of': 5},
+        {'ts': 2.0, 'cam_id': 0, 'track_id': 2, 'on_watchlist': false,
+          'files': ['0/b.jpg'], 'votes': 0, 'of': 4},
+      ]);
+      expect(log.entries.length, 2);
+      expect(log.entries.every((e) => e.kind == AlertKind.face), isTrue);
+      expect(log.entries.every((e) => e.severity == AlertSeverity.info), isTrue);
+      expect(log.unackedCount, 0);
+      expect(log.entries.first.historical, isTrue); // first poll = history
     });
 
     test('first snapshot poll is history: logged, never alarmed', () {

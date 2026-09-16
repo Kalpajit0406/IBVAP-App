@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ibvap.detector import Detection, StreamResult          # noqa: E402
+from ibvap.face import FaceHit                                # noqa: E402
 from ibvap.posture import PostureFlags                       # noqa: E402
 from ibvap.risk_engine import RiskEngine                     # noqa: E402
 from ibvap.weapon import WeaponHit                           # noqa: E402
@@ -39,18 +40,26 @@ def _person(tid: int, *, aim: bool = False, lying: bool = False) -> Detection:
     return d
 
 
-def _sr(cam_id: int, dets: list[Detection], weapons: list | None = None) -> StreamResult:
+def _sr(cam_id: int, dets: list[Detection], weapons: list | None = None,
+       faces: list | None = None) -> StreamResult:
     return StreamResult(
         cam_id=cam_id, timestamp=0.0, frame=None, detections=dets,
         person_count=sum(d.is_person for d in dets),
         vehicle_count=sum(d.is_vehicle for d in dets),
-        weapons=weapons or [],
+        weapons=weapons or [], faces=faces or [],
     )
 
 
 def _gun(track: int, confirmed: bool = True) -> WeaponHit:
     return WeaponHit(bbox=(0, 0, 5, 5), conf=0.8, cls_name="gun",
                      person_track=track, confirmed=confirmed)
+
+
+def _face(track: int, name: str = "Suspect", on_watchlist: bool = True,
+         sim: float = 0.6) -> FaceHit:
+    return FaceHit(person_track=track, bbox=(0, 0, 5, 5), det_score=0.9,
+                  matched_id=name.lower(), matched_name=name,
+                  similarity=sim, on_watchlist=on_watchlist)
 
 
 CASES = []
@@ -156,6 +165,36 @@ def _(rk):
     ra = rk.assess(_sr(1, [_person(1, aim=True), _person(2)], weapons=[_gun(2)]))
     assert ra.weapon is True and ra.armed is False, ra
     assert ra.weapon_tier in ("gun", "posture"), ra
+
+
+@case("a burst-confirmed watchlist face match forces Critical with the name")
+def _(rk):
+    ra = rk.assess(_sr(1, [_person(1)], faces=[_face(1, "Alice")]))
+    assert ra.criminal_match is True and ra.criminal_name == "Alice", ra
+    assert ra.level == "Critical" and ra.score >= 96, ra
+    assert ra.weapon is False and ra.armed is False, ra   # no weapon signal here
+
+
+@case("an UNconfirmed face hit (on_watchlist False) never forces Critical")
+def _(rk):
+    ra = rk.assess(_sr(1, [_person(1)], faces=[_face(1, "Alice", on_watchlist=False)]))
+    assert ra.criminal_match is False and ra.criminal_name == "", ra
+    assert ra.level in ("Normal", "High"), ra
+
+
+@case("a watchlist face match plus a confirmed gun -> still Critical, armed's floor (99) wins")
+def _(rk):
+    ra = rk.assess(_sr(1, [_person(1, aim=True)], weapons=[_gun(1)], faces=[_face(1, "Alice")]))
+    assert ra.criminal_match is True and ra.armed is True, ra
+    assert ra.level == "Critical" and ra.score >= 99, ra   # armed's 99 floor, not downgraded to 96
+
+
+@case("a plain person, no weapon, no face match -> still capped at High (score_can_reach_critical stays honoured)")
+def _(rk):
+    rk._time_of_day = lambda: 1.0   # night, so the weighted score alone would want Critical
+    ra = rk.assess(_sr(0, [_person(i) for i in range(5)]))
+    assert ra.criminal_match is False, ra
+    assert ra.level == "High", ra
 
 
 def run() -> int:

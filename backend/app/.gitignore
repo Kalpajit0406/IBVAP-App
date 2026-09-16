@@ -10,6 +10,10 @@
 # ...and the trained weapon detector (yolo26n fine-tune on YouTube-GDD, ~6 MB),
 # so a fresh clone can demo gun detection without re-training. See models/README.md.
 !models/weapon_detector.pt
+# ...and the InsightFace RetinaFace detector (17 MB, non-commercial research licence).
+# The ArcFace recogniser (w600k_r50.onnx, 167 MB) is excluded — over GitHub's 100 MB
+# hard limit; it ships in the release package but is not committed to the repo.
+!models/face/models/ibvap_face/det_10g.onnx
 
 # ── Generated test media ────────────────────────────────────────────────────
 # Rebuild with:  python make_test_videos.py

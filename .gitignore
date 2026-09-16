@@ -36,6 +36,13 @@ migrate_working_dir/
 # The vendored standalone Python backend runtime (Python + torch/CUDA/ultralytics venv) — several GB.
 /backend/runtime/
 
+# Large ONNX weights that exceed GitHub's 100 MB hard limit — ship in the release package, not the repo.
+# det_10g.onnx (17 MB) is fine to track; w600k_r50.onnx (166 MB) is not.
+backend/app/models/face/models/ibvap_face/w600k_r50.onnx
+
+# Flutter Windows debug symbols — 240 MB, not needed for source control.
+windows/flutter/ephemeral/*.pdb
+
 # Symbolication related
 app.*.symbols
 

@@ -700,6 +700,23 @@ class AnprEngine:
                 self._q.task_done()
 
     def _process_crop(self, cam_id: int, tid: int, roi, bbox) -> None:
+        # `support` (below) does double duty: it decides whether THIS reading
+        # confirms, and — via PlateReading.reads feeding detector.py's
+        # `confident = r.confirmed and r.reads >= stop_after_reads` gate —
+        # whether the vehicle-arrival tracker stops asking for more follow-up
+        # crops. Loosening it to near-match (edit distance <= 1) instead of
+        # exact text equality was tried on real footage and reverted: it
+        # confirms genuinely correct-but-never-repeated fusion answers faster
+        # (good), but by the SAME mechanism it also locks onto an early wrong
+        # near-match blend faster, on tracks where more follow-up reads would
+        # have surfaced 3 clean EXACT repeats of the right plate. Exact-match
+        # support is slower to confirm but effectively keeps the follow-up
+        # window open longer, which on real, noisy street footage measurably
+        # won more often across a track's whole follow-up budget than it lost
+        # by understating support on well-fused-but-never-repeated answers. If
+        # revisiting this, decouple "confirmed enough to display" from
+        # "settled enough to stop collecting more reads" into two thresholds
+        # instead of reusing one `support` value for both.
         self.stats.ocr_runs += 1
         if self._fp is not None:
             text, conf, mn, valid, seq = self._best_candidate(self._decoded_candidates(roi))
