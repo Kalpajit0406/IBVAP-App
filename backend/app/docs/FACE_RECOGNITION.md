@@ -52,8 +52,42 @@ steps:
    vote.
 
 A finalized burst — matched or "unknown" — is always filed to
-`data/face_results/<cam_id>/` (a picture per burst-tick + one JSON record);
-only a confirmed watchlist match is also hash-chained into evidence.
+`data/face_results/<cam_id>/` (the best face crop + a person-context crop + one
+JSON record); only a confirmed watchlist match is also hash-chained into
+evidence.
+
+A burst that lapses its `attempt_window_s` while off the capture list — because
+the window expired, the motion gate closed, or the person left frame mid-burst
+— is finalized by a sweep (`PersonArrivalTracker.sweep_expired`) rather than
+left pending. Without that sweep such a burst never produced a verdict at all:
+`wants_capture()` and `record()`'s finish test are exact complements on the time
+window, so the tick the window lapsed the track simply stopped being offered and
+`record()` was never called again. A person standing still in front of a camera
+reached that branch routinely, which is why a live demo logged nothing.
+
+## Always keeping a picture of the person
+
+Every person on a capture tick is photographed, whether or not they can be
+recognised. This is deliberately **two separate bars**:
+
+| bar | key | gates |
+|---|---|---|
+| `capture_score_min` (0.20) | save | is this crop worth keeping at all |
+| `det_score_min` (0.55) | vote | may this reading name someone |
+
+A face that is blurry, side-on, backlit or distant falls between them: it is
+saved for the operator but marked `trusted: false` and can never vote, so
+always-capture adds **no** false-match risk. Below `capture_score_min` there is
+no detectable face at all, and `head_box_fallback` crops the head region
+estimated from the YOLO person box instead (recorded as
+`face_source: "head_box"`), so someone who never turns toward the camera is
+still on file rather than invisible.
+
+Each burst keeps only its **best** candidate, scored on detector confidence,
+face pixel area, sharpness (log-normalised Laplacian variance) and frontality.
+An actually-detected face always outranks a head-box guess regardless of score.
+Nothing is written until the burst finalizes, so one arrival costs two small
+crops (~25 KB) instead of a full-resolution frame per burst tick (~1 MB).
 
 ### Fusion tiers (`ibvap/risk_engine.py`)
 
@@ -181,14 +215,19 @@ satisfy the feature this pass covers.
   all, the identity is confident. Raising `det_size` does **not** help (320 →
   800 was measured at identical accuracy for 2x the time, because the crop is
   already upscaled past the point of adding information) — the lost pixels are
-  gone before the frame reaches the server. The lever that does work is
-  `SEND_W_MAX` in `static/camera.html`: raising 960 → 1280 lifted similarity by
-  ~0.10-0.14 across the board and turned the marginal 10 m case into a solid
-  match. It costs uplink bandwidth, which is exactly what that constant was
-  lowered to protect, so treat it as a site-by-site tuning decision — on a
-  congested link the client already falls back to q0.40, which testing showed
-  costs only ~0.03-0.07 similarity and is not what limits range.
-  JPEG quality is not the problem; pixels on the face are.
+  gone before the frame reaches the server. The lever that works is **send
+  resolution**: 960 → 1280 lifted similarity by ~0.10-0.14 across the board and
+  turned the marginal 10 m case into a solid match. JPEG quality is not the
+  problem; pixels on the face are (q0.55 → q0.40 costs only ~0.03-0.07).
+
+  Send resolution is no longer a fixed constant — `ibvap/uplink_tuner.py`
+  chooses it per camera from measured latency (`ingest.adaptive`). Its ladder
+  deliberately **gives up frame rate before resolution**, because a burst needs
+  only a handful of good frames over several seconds while range depends
+  directly on pixels: 1280×720@4 costs about the same bitrate as 960×540@8 and
+  recognises people considerably further away. Range therefore varies with link
+  quality — the rung in use is drawn on the video overlay next to the latency,
+  and is in `/status` under `uplink`.
 - **No liveness / anti-spoof check.** A printed photo or a phone/tablet
   screen held up to the camera can also match. This is a known gap, not
   addressed this pass — a real security deployment needs a liveness check

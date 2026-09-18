@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -36,6 +38,10 @@ logger = logging.getLogger("ibvap.geofence")
 _TARGETS = {"person", "vehicle", "any"}
 _DIRECTIONS = {"a2b", "b2a", "both"}
 _KINDS = {"polygon", "line"}
+_SEVERITIES = ("Info", "Low", "Medium", "High", "Critical")
+_INBOUND = {"", "a2b", "b2a"}
+_HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+_MAX_LOITER_S = 86400.0          # a day; longer is a typo, not a policy
 
 
 # ── geometry helpers (all coordinates normalised 0..1) ───────────────────────
@@ -111,6 +117,24 @@ class Fence:
     label: str = ""
     enabled: bool = True
     created_at: float = 0.0
+    # Not every fence is an emergency. A perimeter wire at a BOP is Critical;
+    # a counting line across an approach road is Info. One flat severity for
+    # every zone is how an operator learns to ignore the alarm.
+    severity: str = "Critical"
+    # Raise a separate alert when someone stays inside this long (seconds).
+    # 0 disables. "He has been at the fence eleven minutes" is a thing a post
+    # actually acts on, and nothing could express it before.
+    loiter_after_s: float = 0.0
+    # Local-time arming window, "HH:MM". Equal values mean always armed. A
+    # gate that is legitimately busy by day and forbidden after dark needs
+    # this or it is turned off entirely.
+    armed_from: str = ""
+    armed_to: str = ""
+    # Which crossing direction means "into our territory". There is no camera
+    # calibration and therefore no true geo-projection, so this is what the
+    # person who drew the line says it is — honest, and the only thing that
+    # makes a count meaningful in a report.
+    inbound: str = ""                           # "" | "a2b" | "b2a"
 
     def wants(self, det) -> bool:
         if "any" in self.targets:
@@ -118,12 +142,38 @@ class Fence:
         return (("person" in self.targets and det.is_person) or
                 ("vehicle" in self.targets and det.is_vehicle))
 
+    def armed_at(self, when: float) -> bool:
+        """Is this fence live at `when` (epoch seconds, local time)?"""
+        if not self.armed_from or not self.armed_to or self.armed_from == self.armed_to:
+            return True
+        try:
+            f_h, f_m = (int(x) for x in self.armed_from.split(":"))
+            t_h, t_m = (int(x) for x in self.armed_to.split(":"))
+        except (ValueError, AttributeError):
+            return True
+        lt = time.localtime(when)
+        now_m = lt.tm_hour * 60 + lt.tm_min
+        start, end = f_h * 60 + f_m, t_h * 60 + t_m
+        if start <= end:
+            return start <= now_m < end
+        return now_m >= start or now_m < end     # window crosses midnight
+
+    def label_direction(self, dirn: Optional[str]) -> str:
+        """'inbound' / 'outbound' when the operator has said which is which,
+        else the raw geometric direction."""
+        if not dirn or not self.inbound:
+            return dirn or ""
+        return "inbound" if dirn == self.inbound else "outbound"
+
     def to_public(self) -> dict:
         """The subset the dashboard overlay and /status need."""
         return {"id": self.id, "cam_id": self.cam_id, "kind": self.kind,
                 "points": [[round(x, 5), round(y, 5)] for x, y in self.points],
                 "direction": self.direction, "label": self.label,
-                "targets": sorted(self.targets), "enabled": self.enabled}
+                "targets": sorted(self.targets), "enabled": self.enabled,
+                "severity": self.severity, "loiter_after_s": self.loiter_after_s,
+                "armed_from": self.armed_from, "armed_to": self.armed_to,
+                "inbound": self.inbound}
 
 
 @dataclass
@@ -136,6 +186,8 @@ class Breach:
     is_vehicle: bool
     ground_point: tuple[float, float]           # normalised
     direction: Optional[str]                    # set for line crossings
+    event: str = "breach"                       # "breach" | "loiter"
+    elapsed_s: float = 0.0                      # dwell time, for a loiter event
 
 
 def _synth_id(cam_id: int, pts: list[tuple[float, float]]) -> str:
@@ -157,6 +209,14 @@ def _parse_fence(r: dict) -> Fence:
         label=str(r.get("label", "")),
         enabled=bool(r.get("enabled", True)),
         created_at=float(r.get("created_at", 0.0)),
+        # `or` rather than a .get default: an explicit JSON null must fall back
+        # to the default instead of becoming the string "None" or crashing
+        # float(), which would silently discard the whole fence.
+        severity=str(r.get("severity") or "Critical"),
+        loiter_after_s=float(r.get("loiter_after_s") or 0.0),
+        armed_from=str(r.get("armed_from") or ""),
+        armed_to=str(r.get("armed_to") or ""),
+        inbound=str(r.get("inbound") or ""),
     )
 
 
@@ -172,12 +232,25 @@ class GeoFenceEngine:
         # Consecutive "outside" passes before a polygon breach is considered
         # ended — stops a target hugging the boundary from re-firing every pass.
         self._exit_passes = max(1, int(gf.get("exit_passes", 2)))
+        # A single spurious detection whose ground point lands inside a polygon
+        # used to raise Critical immediately. Requiring the track to have been
+        # seen a few passes costs under a second and removes that whole class
+        # of false alarm — which is what gets a system switched off.
+        self._min_track_passes = max(1, int(gf.get("min_track_passes", 3)))
+        self._min_box_frac = float(gf.get("min_box_height_frac", 0.0))
         self._by_cam: dict[int, list[Fence]] = {}
         # per-track state, keyed (cam_id, track_id) / (cam_id, fence_id, track_id)
         self._prev_ground: dict[tuple[int, int], tuple[float, float]] = {}
-        self._inside: set[tuple[int, str, int]] = set()
+        # (cam, fence, track) -> epoch seconds the target entered. Was a bare
+        # set; the timestamp is what makes dwell time answerable.
+        self._inside: dict[tuple[int, str, int], float] = {}
+        self._loitered: set[tuple[int, str, int]] = set()   # alerted once
         self._exit_streak: dict[tuple[int, str, int], int] = {}
         self._cooldown: dict[tuple[int, str, int], int] = {}
+        self._seen: dict[tuple[int, int], int] = {}         # track maturity
+        # (cam, fence_id, direction) -> count, since the last daily rollover
+        self._crossings: dict[tuple[int, str, str], int] = {}
+        self._counts_day = time.strftime("%Y-%m-%d")
 
     @property
     def enabled(self) -> bool:
@@ -247,6 +320,37 @@ class GeoFenceEngine:
                 int(r["cam_id"])
             except (KeyError, TypeError, ValueError):
                 errs.append(f"{p}: cam_id must be an integer")
+            errs.extend(GeoFenceEngine._validate_settings(r, p))
+        return errs
+
+    @staticmethod
+    def _validate_settings(r: dict, p: str) -> list[str]:
+        """The per-fence behaviour fields. Absent and JSON null both mean
+        "unset" — a client that does not know a field must not be rejected for
+        omitting it, but a client that sends garbage must be told, because
+        _parse_fence would otherwise drop the whole fence without a word."""
+        errs: list[str] = []
+        sev = r.get("severity")
+        if sev is not None and sev not in _SEVERITIES:
+            errs.append(f"{p}: severity must be one of {list(_SEVERITIES)}")
+        loiter = r.get("loiter_after_s")
+        if loiter is not None:
+            # bool is an int in Python; `true` is not a number of seconds.
+            if (isinstance(loiter, bool) or not isinstance(loiter, (int, float))
+                    or not 0.0 <= float(loiter) <= _MAX_LOITER_S):
+                errs.append(f"{p}: loiter_after_s must be a number of seconds "
+                            f"between 0 and {int(_MAX_LOITER_S)}")
+        frm, to = r.get("armed_from") or "", r.get("armed_to") or ""
+        for name, val in (("armed_from", frm), ("armed_to", to)):
+            if val and not (isinstance(val, str) and _HHMM.match(val)):
+                errs.append(f"{p}: {name} must be a 24-hour HH:MM time")
+        if bool(frm) != bool(to):
+            # armed_at() treats a half-set window as "always armed", so a fence
+            # meant to be night-only would silently stay live all day.
+            errs.append(f"{p}: armed_from and armed_to must be set together")
+        inbound = r.get("inbound")
+        if inbound is not None and inbound not in _INBOUND:
+            errs.append(f"{p}: inbound must be one of {sorted(_INBOUND)}")
         return errs
 
     # ── query ──────────────────────────────────────────────────────────────
@@ -281,7 +385,10 @@ class GeoFenceEngine:
             if self._cooldown[k] <= 0:
                 del self._cooldown[k]
 
-        fences = [f for f in self._by_cam.get(cam, []) if f.enabled]
+        now = time.time()
+        self._roll_counts(now)
+        fences = [f for f in self._by_cam.get(cam, [])
+                  if f.enabled and f.armed_at(now)]
         if not fences:
             return []
 
@@ -293,6 +400,12 @@ class GeoFenceEngine:
             tid = int(d.track_id)
             if tid < 0:
                 continue
+            seen = self._seen[(cam, tid)] = self._seen.get((cam, tid), 0) + 1
+            mature = seen >= self._min_track_passes
+            if self._min_box_frac > 0 and frame is not None:
+                y1, y2 = d.bbox[1], d.bbox[3]
+                if (y2 - y1) < self._min_box_frac * h:
+                    mature = False
             g = ground_point(d.bbox, w, h)
             prev = self._prev_ground.get((cam, tid))
 
@@ -305,17 +418,30 @@ class GeoFenceEngine:
                     if point_in_polygon(g, f.points):
                         self._exit_streak.pop(key, None)
                         if key not in self._inside:
-                            self._inside.add(key)
+                            if not mature:
+                                continue      # too new to trust; no state either
+                            self._inside[key] = now
                             breaches.append(Breach(
                                 cam, f, tid, d.class_name,
                                 d.is_person, d.is_vehicle, g, None))
+                        elif (f.loiter_after_s > 0 and key not in self._loitered
+                                and now - self._inside[key] >= f.loiter_after_s):
+                            # Still inside, and has been for long enough to stop
+                            # being an intrusion and start being a loiterer.
+                            self._loitered.add(key)
+                            breaches.append(Breach(
+                                cam, f, tid, d.class_name,
+                                d.is_person, d.is_vehicle, g, None,
+                                event="loiter",
+                                elapsed_s=round(now - self._inside[key], 1)))
                     elif key in self._inside:
                         self._exit_streak[key] = self._exit_streak.get(key, 0) + 1
                         if self._exit_streak[key] >= self._exit_passes:
-                            self._inside.discard(key)
+                            self._inside.pop(key, None)
+                            self._loitered.discard(key)
                             self._exit_streak.pop(key, None)
 
-                elif prev is not None:                      # line / polyline
+                elif prev is not None and mature:            # line / polyline
                     pts = f.points
                     for i in range(len(pts) - 1):
                         a, b = pts[i], pts[i + 1]
@@ -326,6 +452,8 @@ class GeoFenceEngine:
                                 and f.direction in ("both", dirn)
                                 and key not in self._cooldown):
                             self._cooldown[key] = self._cooldown_passes
+                            ckey = (cam, f.id, f.label_direction(dirn) or dirn)
+                            self._crossings[ckey] = self._crossings.get(ckey, 0) + 1
                             breaches.append(Breach(
                                 cam, f, tid, d.class_name,
                                 d.is_person, d.is_vehicle, g, dirn))
@@ -335,6 +463,30 @@ class GeoFenceEngine:
 
         return breaches
 
+    # ── crossing tallies ────────────────────────────────────────────────────
+    def _roll_counts(self, now: float) -> None:
+        """Counts are per day. 'Six people crossed north-to-south tonight' is
+        the report a post files; a running total since boot is not."""
+        day = time.strftime("%Y-%m-%d", time.localtime(now))
+        if day != self._counts_day:
+            self._counts_day, self._crossings = day, {}
+
+    def crossing_counts(self) -> dict:
+        """{cam_id: {fence_id: {direction: n}}} for today, plus the date."""
+        out: dict = {}
+        for (cam, fid, dirn), n in sorted(self._crossings.items()):
+            out.setdefault(str(cam), {}).setdefault(fid, {})[dirn] = n
+        return {"date": self._counts_day, "by_camera": out}
+
+    def dwelling(self, now: float | None = None) -> list[dict]:
+        """Who is inside a zone right now, and for how long — the live answer
+        to 'is anyone at the fence?' rather than a record that they once were."""
+        now = time.time() if now is None else now
+        return [{"cam_id": cam, "fence_id": fid, "track_id": tid,
+                 "elapsed_s": round(now - since, 1),
+                 "alerted": (cam, fid, tid) in self._loitered}
+                for (cam, fid, tid), since in sorted(self._inside.items())]
+
     def prune(self, cam_id: int, live_track_ids) -> None:
         """Drop per-track state for track ids this camera no longer reports —
         mirrors PoseClassifier.flush_missing so the dicts can't grow unbounded
@@ -343,9 +495,13 @@ class GeoFenceEngine:
         live = set(int(t) for t in live_track_ids)
         for k in [k for k in self._prev_ground if k[0] == cam and k[1] not in live]:
             del self._prev_ground[k]
-        self._inside = {k for k in self._inside
+        self._inside = {k: v for k, v in self._inside.items()
                         if not (k[0] == cam and k[2] not in live)}
+        self._loitered = {k for k in self._loitered
+                          if not (k[0] == cam and k[2] not in live)}
         for k in [k for k in self._exit_streak if k[0] == cam and k[2] not in live]:
             del self._exit_streak[k]
         for k in [k for k in self._cooldown if k[0] == cam and k[2] not in live]:
             del self._cooldown[k]
+        for k in [k for k in self._seen if k[0] == cam and k[1] not in live]:
+            del self._seen[k]

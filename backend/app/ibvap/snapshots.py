@@ -35,7 +35,7 @@ from .imaging import encode_jpeg, slug as _slug
 
 logger = logging.getLogger("ibvap.snapshots")
 
-REASONS = ("breach", "weapon", "posture")
+REASONS = ("breach", "weapon", "posture", "loiter")
 
 
 def malicious_postures(detections) -> list:

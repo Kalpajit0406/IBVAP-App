@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
+import '../../models/fence.dart';
 import '../../state/app_state.dart';
 import '../../theme.dart';
 
@@ -13,11 +15,19 @@ class FencesSection extends StatefulWidget {
 
 class _FencesSectionState extends State<FencesSection> {
   final _label = TextEditingController();
+  final _loiter = TextEditingController();
+  final _from = TextEditingController();
+  final _to = TextEditingController();
   int? _cam;
+  // Which draft the text fields currently show; see FenceEditor.revision.
+  int _rev = -1;
 
   @override
   void dispose() {
     _label.dispose();
+    _loiter.dispose();
+    _from.dispose();
+    _to.dispose();
     super.dispose();
   }
 
@@ -39,9 +49,15 @@ class _FencesSectionState extends State<FencesSection> {
         if (_cam != null && ids.isNotEmpty && !ids.contains(_cam)) {
           _cam = ids.first;
         }
-        // keep the label field in step when an edit loads a fence
-        if (ed.armed && ed.editingId != null && _label.text != ed.label) {
+        // Push the draft into the text fields only when a different draft was
+        // loaded (edit started, or cancelled/saved). Never on a keystroke —
+        // the fields are the source of truth while the operator is typing.
+        if (_rev != ed.revision) {
+          _rev = ed.revision;
           _label.text = ed.label;
+          _loiter.text = ed.loiterText;
+          _from.text = ed.armedFrom;
+          _to.text = ed.armedTo;
         }
         final active = widget.state.status?.geofenceActive ?? const {};
 
@@ -105,6 +121,69 @@ class _FencesSectionState extends State<FencesSection> {
                 decoration: const InputDecoration(hintText: 'label (optional)'),
                 onChanged: ed.setLabel,
               ),
+              const SizedBox(height: 6),
+              _dropdown<String>(
+                // A value the server holds that this build does not list must
+                // not crash the dropdown; show Critical, the safe default.
+                value: Fence.severities.contains(ed.severity)
+                    ? ed.severity
+                    : 'Critical',
+                items: [
+                  for (final s in Fence.severities)
+                    DropdownMenuItem(value: s, child: Text('$s alert')),
+                ],
+                onChanged: (v) => ed.setSeverity(v ?? 'Critical'),
+              ),
+              if (ed.kind == 'polygon') ...[
+                const SizedBox(height: 6),
+                TextField(
+                  controller: _loiter,
+                  style: const TextStyle(fontSize: 12, color: IbvapColors.text),
+                  keyboardType: TextInputType.number,
+                  inputFormatters: [
+                    FilteringTextInputFormatter.allow(RegExp(r'[0-9.]')),
+                  ],
+                  decoration: const InputDecoration(
+                      labelText: 'Loiter alert after (seconds)',
+                      hintText: 'blank = off'),
+                  onChanged: ed.setLoiterText,
+                ),
+              ] else ...[
+                const SizedBox(height: 6),
+                _dropdown<String>(
+                  value: const ['a2b', 'b2a'].contains(ed.inbound)
+                      ? ed.inbound
+                      : '',
+                  items: const [
+                    DropdownMenuItem(value: '', child: Text('Inbound: not set')),
+                    DropdownMenuItem(
+                        value: 'a2b', child: Text('Inbound = A → B')),
+                    DropdownMenuItem(
+                        value: 'b2a', child: Text('Inbound = B → A')),
+                  ],
+                  onChanged: (v) => ed.setInbound(v ?? ''),
+                ),
+              ],
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Expanded(child: _timeField(_from, 'Armed from', ed.setArmedFrom)),
+                  const SizedBox(width: 6),
+                  Expanded(child: _timeField(_to, 'Armed to', ed.setArmedTo)),
+                ],
+              ),
+              const Padding(
+                padding: EdgeInsets.only(top: 3),
+                child: Text('Leave both blank to keep the fence armed always.',
+                    style: TextStyle(color: IbvapColors.muted, fontSize: 9)),
+              ),
+              if (ed.settingsError != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 3),
+                  child: Text(ed.settingsError!,
+                      style: const TextStyle(
+                          color: IbvapColors.red, fontSize: 10)),
+                ),
               const SizedBox(height: 8),
               Row(
                 children: [
@@ -237,6 +316,11 @@ class _FencesSectionState extends State<FencesSection> {
                           color: IbvapColors.blue,
                           fontSize: 9,
                           fontWeight: FontWeight.w700)),
+                  if (_settingsSummary(f).isNotEmpty)
+                    TextSpan(
+                        text: '  ${_settingsSummary(f)}',
+                        style: const TextStyle(
+                            color: IbvapColors.muted, fontSize: 9)),
                 ]),
                 overflow: TextOverflow.ellipsis,
               ),
@@ -254,6 +338,37 @@ class _FencesSectionState extends State<FencesSection> {
         ],
       ),
     );
+  }
+
+  Widget _timeField(
+      TextEditingController c, String label, ValueChanged<String> onChanged) {
+    return TextField(
+      controller: c,
+      style: const TextStyle(fontSize: 12, color: IbvapColors.text),
+      inputFormatters: [
+        FilteringTextInputFormatter.allow(RegExp(r'[0-9:]')),
+        LengthLimitingTextInputFormatter(5),
+      ],
+      decoration: InputDecoration(labelText: label, hintText: 'HH:MM'),
+      onChanged: onChanged,
+    );
+  }
+
+  /// The non-default behaviour settings of a fence as one short line, so what
+  /// was saved is visible in the list rather than only inside the edit form.
+  String _settingsSummary(dynamic f) {
+    final parts = <String>[];
+    if (f.severity != 'Critical') parts.add('${f.severity}');
+    final loiter = f.loiterAfterS as double;
+    if (loiter > 0) {
+      parts.add('loiter ${loiter == loiter.roundToDouble() ? loiter.round() : loiter}s');
+    }
+    if ((f.armedFrom as String).isNotEmpty) {
+      parts.add('armed ${f.armedFrom}–${f.armedTo}');
+    }
+    if (f.inbound == 'a2b') parts.add('inbound A→B');
+    if (f.inbound == 'b2a') parts.add('inbound B→A');
+    return parts.join(' · ');
   }
 
   Widget _dropdown<T>({

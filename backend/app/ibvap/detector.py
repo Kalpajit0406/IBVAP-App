@@ -376,13 +376,21 @@ class Detector:
 
         # ── Event-triggered face capture: per-person burst tracker + writer ──
         from .face_events import PersonArrivalTracker, FaceResultWriter
+        # Keep the prune grace inside ByteTrack's own lost-track window: the
+        # tracker re-associates a briefly-lost person under the same id, so
+        # dropping burst state sooner than it gives up loses work it will need.
+        _lost_frames = float((config.get("tracker", {}) or {}).get("lost_buffer_frames", 60))
+        _detect_fps = max(1.0, float((config.get("model", {}) or {}).get("detect_fps", 8)))
         self._face_arrival = (face_arrival if face_arrival is not None
                               else PersonArrivalTracker(
                                   burst_n=int(face_cfg.get("burst_n", 5)),
                                   max_attempts=int(face_cfg.get("max_attempts", 15)),
                                   attempt_window_s=float(face_cfg.get("attempt_window_s", 8.0)),
                                   vote_min=int(face_cfg.get("vote_min", 3)),
-                                  hit_ttl_s=float(face_cfg.get("hit_ttl_s", 4.0))))
+                                  hit_ttl_s=float(face_cfg.get("hit_ttl_s", 4.0)),
+                                  prune_grace_s=float(face_cfg.get(
+                                      "prune_grace_s", min(2.0, _lost_frames / _detect_fps))),
+                                  sweep_grace_s=float(face_cfg.get("sweep_grace_s", 1.0))))
         self.face_results = (face_results if face_results is not None
                              else FaceResultWriter(config))
         self._face_use_native = bool(face_cfg.get("use_native_frame", True))
@@ -854,14 +862,21 @@ class Detector:
         """Returns {cam_id: [WeaponHit, ...]}. Empty dict when disabled."""
         if self.weapon is None:
             return {}
+        # Skip cameras where the detector found nothing at all this pass. The
+        # frame already cleared the motion gate, so something moved — but wind,
+        # rain or a light shift moving nothing detectable is not worth a weapon
+        # forward pass. Trade-off: a weapon in a frame where YOLO detected no
+        # object whatsoever is missed.
         per_cam = [
             (cam_id, frame,
              [(*d.bbox, d.track_id,
                bool(d.posture is not None and d.posture.chest_aim),
                _wrists(d))
               for d in dets if d.is_person and d.track_id >= 0])
-            for cam_id, _ts, frame, dets in staged
+            for cam_id, _ts, frame, dets in staged if dets
         ]
+        if not per_cam:
+            return {}
         out = self.weapon.detect_batch(per_cam, self._tick)
 
         # Drop weapon streak/state for person tracks no longer live on their cam.
@@ -887,6 +902,15 @@ class Detector:
         now = time.time()
         due_by_cam: list[tuple[int, np.ndarray, list]] = []
 
+        # Finalize bursts whose window lapsed while they were off the due-list
+        # (window expiry, motion gate, person left frame). Outside the
+        # detect_every gate: a stalled burst must not wait on a capture tick.
+        for verdict in self._face_arrival.sweep_expired(now):
+            rec = self.face_results.flush_best(verdict.cam_id, verdict.track_id,
+                                               verdict, now)
+            if rec is not None:
+                self._face_arrivals.append(rec)
+
         # New capture attempts are paced to every Nth detection pass
         # (face.detect_every) to spread GPU cost when several people arrive at
         # once — but reading back an already-finalized match (below) always
@@ -903,24 +927,29 @@ class Detector:
                 if not due:
                     continue
                 native = self._native_for(cam_id, ts) if self._face_use_native else None
-                src = native if native is not None else frame
-                due_by_cam.append((cam_id, src, [(*d.bbox, d.track_id) for d in due]))
+                # Boxes stay in working-frame coordinates; FaceEngine scales
+                # them into the native frame and scales its results back, the
+                # same contract AnprEngine.submit_batch uses.
+                due_by_cam.append((cam_id, frame,
+                                   [(*d.bbox, d.track_id) for d in due], native))
 
         hits_by_cam = self.face.identify_batch(due_by_cam) if due_by_cam else {}
 
-        for cam_id, src, persons in due_by_cam:
+        for cam_id, _frame, persons, _native in due_by_cam:
             hit_by_track = {h.person_track: h for h in hits_by_cam.get(cam_id, [])}
-            for x1, y1, x2, y2, tid in persons:
+            for _x1, _y1, _x2, _y2, tid in persons:
                 key = (cam_id, tid)
                 hit = hit_by_track.get(tid)
-                if hit is not None:
-                    seq = self._face_arrival.attempts_so_far(key)
-                    self.face_results.capture_snapshot(
-                        cam_id, src, tid, seq,
-                        {"detail": hit.matched_name or ""}, now)
+                # Always offer a candidate, even when no face cleared detection:
+                # a blurry, side-on, shadowed or distant person still gets their
+                # head region kept. The writer keeps only the best of the burst.
+                self.face_results.offer_candidate(
+                    cam_id, tid, hit,
+                    {"detail": (hit.matched_name or "") if hit is not None else ""},
+                    now)
                 verdict = self._face_arrival.record(key, now, hit)
                 if verdict is not None:
-                    rec = self.face_results.finalize(cam_id, tid, verdict, now)
+                    rec = self.face_results.flush_best(cam_id, tid, verdict, now)
                     if rec is not None:
                         self._face_arrivals.append(rec)
 
@@ -930,7 +959,10 @@ class Detector:
         # via fresh_hit() on tracks that weren't due this tick.
         faces_by_cam: dict[int, list] = {}
         for cam_id, _ts, _frame, dets in staged:
-            out = list(hits_by_cam.get(cam_id, []))
+            # Untrusted/head-box candidates exist only to be snapshotted — they
+            # must not reach the overlay, the risk engine or the console, or
+            # every person would sprout a face box with a meaningless score.
+            out = [h for h in hits_by_cam.get(cam_id, []) if h.trusted]
             have = {h.person_track for h in out}
             for d in dets:
                 if not (d.is_person and d.track_id >= 0) or d.track_id in have:
@@ -950,7 +982,7 @@ class Detector:
 
         for cam_id, _ts, _frame, dets in staged:
             live = {d.track_id for d in dets if d.is_person and d.track_id >= 0}
-            self._face_arrival.prune(cam_id, live)
+            self._face_arrival.prune(cam_id, live, now)
         return faces_by_cam
 
     def drain_face_arrivals(self) -> list[dict]:

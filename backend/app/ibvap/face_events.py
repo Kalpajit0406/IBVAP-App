@@ -19,14 +19,18 @@ Two pieces, mirroring anpr_events.py's split:
     Critical override in risk_engine.py.
 
   * `FaceResultWriter` — writes the *separate* face-results output folder
-    (deliberately not a 4th SnapshotWriter reason, same reasoning as ANPR): one
-    small burst of pictures + one JSON record per person arrival, under
+    (deliberately not a 4th SnapshotWriter reason, same reasoning as ANPR): two
+    small crops + one JSON record per person arrival, under
     data/face_results/<cam_id>/, carrying the matched identity (or "unknown"),
-    similarity, and vote count together. Each burst-tick picture is written
-    immediately via capture_snapshot() (so it exists even if the burst never
-    cleanly finalizes) and the record is completed later by finalize() — or, if
-    a burst never finalizes (e.g. the pipeline hot-swaps mid-burst), by
-    sweep_timeouts() so the pictures collected so far are still filed.
+    similarity, and vote count together. Every capture tick offers its crop via
+    offer_candidate(); only the best-scoring one survives, and flush_best()
+    writes it (plus a person-box context crop) once the burst finalizes — or,
+    if a burst somehow never finalizes, sweep_timeouts() flushes it anyway.
+
+    Every person offers a candidate, including those where no face could be
+    detected at all — a geometric head crop stands in — so nobody passes the
+    camera unrecorded. Buffering is what makes that affordable: one arrival
+    costs two small crops rather than a full-resolution frame per burst tick.
 """
 from __future__ import annotations
 
@@ -67,6 +71,7 @@ class _FaceTrackState:
     hits: list = field(default_factory=list)  # FaceHit list, only entries where a face WAS found
     last_watchlist_hit: object = None         # most recent on_watchlist FaceHit, for the TTL cache
     last_watchlist_ts: float = 0.0
+    last_seen: float = 0.0                    # last tick this track appeared in its camera's detections
     done: bool = False
 
 
@@ -75,12 +80,15 @@ class PersonArrivalTracker:
 
     def __init__(self, burst_n: int = 5, max_attempts: int = 15,
                  attempt_window_s: float = 8.0, vote_min: int = 3,
-                 hit_ttl_s: float = 4.0) -> None:
+                 hit_ttl_s: float = 4.0, prune_grace_s: float = 2.0,
+                 sweep_grace_s: float = 1.0) -> None:
         self._burst_n = max(1, int(burst_n))
         self._max_attempts = max(self._burst_n, int(max_attempts))
         self._window_s = max(0.0, float(attempt_window_s))
         self._vote_min = max(1, min(int(vote_min), self._burst_n))
         self._ttl = float(hit_ttl_s)
+        self._prune_grace = max(0.0, float(prune_grace_s))
+        self._sweep_grace = max(0.0, float(sweep_grace_s))
         self._state: dict[tuple[int, int], _FaceTrackState] = {}
 
     def wants_capture(self, key: tuple[int, int], tick: int, now: float) -> bool:
@@ -88,8 +96,10 @@ class PersonArrivalTracker:
         within its attempt/time budget. Opens the track's state on first call."""
         st = self._state.get(key)
         if st is None:
-            self._state[key] = _FaceTrackState(first_tick=tick, first_ts=now)
+            self._state[key] = _FaceTrackState(first_tick=tick, first_ts=now,
+                                               last_seen=now)
             return True
+        st.last_seen = now
         if st.done:
             return False
         return (len(st.hits) < self._burst_n
@@ -109,7 +119,11 @@ class PersonArrivalTracker:
         required — wants_capture() already opens the state."""
         st = self._state.setdefault(key, _FaceTrackState(first_tick=0, first_ts=now))
         st.attempts += 1
-        if hit is not None:
+        st.last_seen = now
+        # Only a *trusted* reading (det_score >= face.det_score_min) is allowed to
+        # vote or count toward burst_n. Low-confidence readings still reach the
+        # writer as snapshot candidates, but must not weaken the identity vote.
+        if hit is not None and getattr(hit, "trusted", True):
             st.hits.append(hit)
             if getattr(hit, "on_watchlist", False):
                 st.last_watchlist_hit, st.last_watchlist_ts = hit, now
@@ -139,6 +153,31 @@ class PersonArrivalTracker:
                                round(sim, 3), votes, of, True)
         return FaceVerdict(cam_id, track_id, now, None, None, 0.0, votes, of, False)
 
+    def sweep_expired(self, now: float) -> list[FaceVerdict]:
+        """Finalize every burst whose time budget lapsed without `record()`
+        being called on the deciding tick.
+
+        `wants_capture()` and `record()`'s `finished` test are exact
+        complements on the time window, so the tick the window expires the
+        track simply stops being offered and `record()` is never called again —
+        leaving the burst permanently un-finalized. It also stops being offered
+        whenever the motion gate closes, the camera is removed, or the person
+        leaves frame mid-burst. A sweep covers all of those; de-complementing
+        the two predicates would only cover the first.
+
+        Returns a real verdict per swept burst — so a burst that collected
+        enough agreeing votes still reports `on_watchlist=True` here rather
+        than being written out as "unknown" by FaceResultWriter.sweep_timeouts.
+        """
+        deadline = self._window_s + self._sweep_grace
+        out: list[FaceVerdict] = []
+        for key, st in list(self._state.items()):
+            if st.done or (now - st.first_ts) <= deadline:
+                continue
+            st.done = True
+            out.append(self._decide(key, st, now))
+        return out
+
     def fresh_hit(self, key: tuple[int, int], now: float):
         """Most recent on_watchlist FaceHit for `key` if still within
         hit_ttl_s — keeps the box/banner alive between bursts, mirrors
@@ -154,14 +193,28 @@ class PersonArrivalTracker:
         fresh arrival."""
         self._state.pop(key, None)
 
-    def prune(self, cam_id: int, live_track_ids) -> None:
-        """Drop state for every tracked person on this camera that is no
-        longer live. ByteTrack ids are not reused, so — unlike
-        SnapshotWriter's cooldown-guarded prune — there is no flicker risk in
-        dropping immediately."""
+    def prune(self, cam_id: int, live_track_ids, now: float | None = None) -> None:
+        """Drop state for tracked people on this camera absent for longer than
+        `prune_grace_s`.
+
+        Dropping the instant a track misses one frame loses the whole burst —
+        `hits` resets to 0, `first_ts` restarts, and `last_watchlist_hit` is
+        destroyed so a confirmed banner flickers. That matters because a
+        detection miss is routine on a blurry or laggy stream. ByteTrack ids
+        not being reused only rules out state from one track landing on
+        another; it says nothing about losing state for a track that continues
+        under the same id — and `tracker.lost_buffer_frames` means ByteTrack
+        itself keeps a lost track alive for seconds and re-associates it.
+        """
+        now = time.time() if now is None else now
         live = {int(t) for t in live_track_ids}
-        for k in [k for k in self._state if k[0] == cam_id and k[1] not in live]:
-            self._state.pop(k, None)
+        for k, st in list(self._state.items()):
+            if k[0] != cam_id:
+                continue
+            if k[1] in live:
+                st.last_seen = now
+            elif now - st.last_seen > self._prune_grace:
+                self._state.pop(k, None)
 
     def status(self) -> dict:
         return {"tracked": len(self._state),
@@ -210,57 +263,101 @@ class FaceResultWriter:
         except OSError as e:
             logger.debug("face_results mkdir %s failed: %s", cam_id, e)
 
-    def capture_snapshot(self, cam_id: int, frame, track_id: int, seq: int,
-                          meta: dict | None = None,
-                          now: float | None = None) -> dict | None:
-        """Writes ONE burst-tick face crop immediately (`seq` = 0-based index
-        within this arrival's burst) and appends it to the arrival's pending
-        record, opening one if this is the first tick of the burst."""
+    def offer_candidate(self, cam_id: int, track_id: int, hit,
+                        meta: dict | None = None,
+                        now: float | None = None) -> bool:
+        """Offer this tick's crop as the burst's saved snapshot; keeps it only
+        if it beats the best so far. No I/O — a burst writes once, in
+        :meth:`flush_best`.
+
+        Called for EVERY person on a capture tick, including those where no
+        face was detectable at all (`hit.source == "head_box"`, or `hit` None),
+        so a blurry, side-on, shadowed or distant person is still recorded.
+        Buffering rather than writing per tick is what makes that affordable:
+        the old path wrote one full-resolution frame per tick and kept them all.
+        """
         if not self.enabled:
-            return None
-        meta = meta or {}
+            return False
         now = time.time() if now is None else now
         cam_id, track_id = int(cam_id), int(track_id)
-        enc = encode_jpeg(frame, self._jpeg_q)
-        if enc is None:
-            return None
-        data, sha = enc
-        try:
-            self._ensure_cam(cam_id)
-            lt = time.localtime(now)
-            stamp = time.strftime("%Y%m%d_%H%M%S", lt) + f"_{int((now % 1) * 1000):03d}"
-            stem = f"{stamp}_{REASON}_track{track_id}_{seq}"
-            detail = slug(meta.get("detail", ""))
-            if detail:
-                stem += f"_{detail}"
-            (self._dir / str(cam_id) / f"{stem}.jpg").write_bytes(data)
-        except OSError as e:
-            logger.debug("face_results write failed (cam %s, track %s): %s",
-                        cam_id, track_id, e)
-            return None
+        crop = getattr(hit, "face_crop", None) if hit is not None else None
+        quality = float(getattr(hit, "quality", 0.0)) if hit is not None else 0.0
+        if crop is None or crop.size == 0:
+            return False
 
         key = (cam_id, track_id)
-        rec = self._pending.setdefault(key, {
-            "ts": round(now, 3), "cam_id": cam_id, "track_id": track_id,
-            "files": [], "sha256s": [],
-        })
-        file_ref = f"{cam_id}/{stem}.jpg"
-        rec["files"].append(file_ref)
-        rec["sha256s"].append(sha)
-        return {"file": file_ref, "sha256": sha}
+        best = self._pending.get(key)
+        if best is None:
+            best = self._pending.setdefault(key, {
+                "ts": round(now, 3), "cam_id": cam_id, "track_id": track_id,
+                "files": [], "sha256s": [], "candidates_seen": 0,
+                "_rank": (-1, -1.0),
+            })
+        best["candidates_seen"] += 1
+        # Rank on (really a face, then quality): an actually-detected face always
+        # beats a geometric head-box guess, however well the guess happens to
+        # score. A guess only wins when nothing better was ever offered.
+        source = str(getattr(hit, "source", "face"))
+        rank = (1 if source == "face" else 0, quality)
+        if rank <= best["_rank"]:
+            return False
 
-    def finalize(self, cam_id: int, track_id: int, verdict: "object",
-                 now: float | None = None) -> dict | None:
-        """Pops the pending burst for (cam_id, track_id), merges the verdict
-        (matched_id/name/similarity/votes/of/on_watchlist), returns the
-        completed record — NOT yet written to index.jsonl. The caller attaches
-        ``ev_hash`` (from the evidence chain) first and passes it to
-        :meth:`record`, the same two-step handoff AnprResultWriter uses.
-        Returns None if nothing was pending (e.g. the burst never found a
-        single usable face — capture_snapshot was never called)."""
+        best.update(_rank=rank, _face=crop,
+                    _person=getattr(hit, "person_crop", None),
+                    _detail=(meta or {}).get("detail", ""),
+                    face_quality=quality,
+                    face_source=source,
+                    face_bbox=[int(v) for v in getattr(hit, "bbox", (0, 0, 0, 0))],
+                    face_det_score=round(float(getattr(hit, "det_score", 0.0)), 3))
+        return True
+
+    def flush_best(self, cam_id: int, track_id: int, verdict: "object",
+                   now: float | None = None) -> dict | None:
+        """Write the burst's best face crop (and its person-context crop), merge
+        the verdict, and return the completed record — the same two-step handoff
+        :meth:`finalize` uses: the caller attaches ``ev_hash`` then calls
+        :meth:`record`. Returns None if the burst never had a usable crop."""
+        if not self.enabled:
+            return None
+        now = time.time() if now is None else now
         key = (int(cam_id), int(track_id))
         rec = self._pending.pop(key, None)
         if rec is None:
+            return None
+        face, person = rec.pop("_face", None), rec.pop("_person", None)
+        detail = rec.pop("_detail", "")
+        rec.pop("_rank", None)
+        if face is None:
+            return None
+
+        lt = time.localtime(now)
+        stamp = time.strftime("%Y%m%d_%H%M%S", lt) + f"_{int((now % 1) * 1000):03d}"
+        base = f"{stamp}_{REASON}_track{int(track_id)}"
+        d = slug(detail)
+        if d:
+            base += f"_{d}"
+        # Index 0 is the face, index 1 the person context — server.py's evidence
+        # row and the Flutter panel both read files[0], so the face is what they
+        # show without either needing to change.
+        for img, suffix in ((face, "face"), (person, "person")):
+            if img is None:
+                continue
+            enc = encode_jpeg(img, self._jpeg_q)
+            if enc is None:
+                continue
+            data, sha = enc
+            try:
+                self._ensure_cam(int(cam_id))
+                stem = f"{base}_{suffix}"
+                (self._dir / str(int(cam_id)) / f"{stem}.jpg").write_bytes(data)
+            except OSError as e:
+                logger.debug("face_results write failed (cam %s, track %s): %s",
+                             cam_id, track_id, e)
+                continue
+            rec["files"].append(f"{int(cam_id)}/{stem}.jpg")
+            rec["sha256s"].append(sha)
+
+        if not rec["files"]:
             return None
         rec.update(
             matched_id=getattr(verdict, "matched_id", None),
@@ -284,12 +381,15 @@ class FaceResultWriter:
         now = time.time() if now is None else now
         stale = [k for k, r in self._pending.items() if now - r["ts"] > timeout_s]
         out = []
-        for k in stale:
-            rec = self._pending.pop(k)
-            rec.update(matched_id=None, matched_name=None, similarity=0.0,
-                      votes=0, of=len(rec.get("files", [])), on_watchlist=False,
-                      ev_hash=None)
-            out.append(rec)
+        # PersonArrivalTracker.sweep_expired should finalize every burst with a
+        # real verdict long before this fires; route through flush_best anyway
+        # so a swept burst still writes its best crop rather than a record whose
+        # files list is empty and whose buffered images leak into the JSON.
+        unknown = FaceVerdict(0, 0, now, None, None, 0.0, 0, 0, False)
+        for cam_id, track_id in stale:
+            rec = self.flush_best(cam_id, track_id, unknown, now)
+            if rec is not None:
+                out.append(rec)
         return out
 
     def record(self, rec: dict) -> None:

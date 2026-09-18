@@ -16,6 +16,8 @@ The dashboard polls /status; there is no server-push channel.
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import logging
 import os
@@ -33,10 +35,12 @@ import torch
 import yaml
 from contextlib import asynccontextmanager
 
-from fastapi import Body, FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
                                Response, StreamingResponse)
 
+from ibvap import ws_capture
+from ibvap.alert_forward import AlertForwarder
 from ibvap.calibration import Calibrator
 from ibvap.detector import Detector
 from ibvap.event_store import EventStore
@@ -48,7 +52,9 @@ from ibvap.rtsp_capture import RtspCapture, redact
 from ibvap.screen_capture import ScreenCapture
 from ibvap.security import (TOKEN_HEADER, ListenerGuard, is_authorized,
                             load_or_create_token)
+from ibvap.sinks import event_payload
 from ibvap.snapshots import SnapshotWriter, malicious_postures
+from ibvap.uplink_tuner import UplinkTuner
 from ibvap.ws_capture import WebSocketCapture
 
 # Windows consoles default to cp1252 and mangle non-ASCII log output
@@ -118,6 +124,8 @@ _camera_meta: dict[int, dict] = {}
 # mosaic builder. Whole-entry replace — lock-free, same as _camera_meta.
 _geofence_fences: dict[int, list] = {}     # cam_id -> [{id,kind,points,label,direction}]
 _geofence_active: dict[int, dict] = {}     # cam_id -> {fence_id: is_breaching}
+_geofence_crossings: dict = {}             # today's per-fence, per-direction tallies
+_geofence_dwelling: list = []              # who is inside a zone right now
 
 # Hand-off from the muxer thread to the inference worker thread. Depth 1: the
 # worker always gets the freshest snapshot; if it falls behind, the muxer drops
@@ -144,13 +152,15 @@ _detection_started = False
 async def _lifespan(app: FastAPI):
     # Both the HTTP and HTTPS listeners share this app, so the lifespan fires
     # twice — the detection thread must only ever start once.
-    global cfg, _detection_started, NORM_W, NORM_H
+    global cfg, _detection_started, NORM_W, NORM_H, _tuner
     if not _detection_started:
         _detection_started = True
         cfg = yaml.safe_load(open("config.yaml"))
         ing = cfg.get("ingest", {}) or {}
         NORM_W = int(ing.get("normalise_width", NORM_W))
         NORM_H = int(ing.get("normalise_height", NORM_H))
+        ws_capture.set_max_frame_age_ms(ing.get("max_frame_age_ms", 1200))
+        _tuner = UplinkTuner(ing)
         _load_streams_overlay()
         _open_configured_streams()
         threading.Thread(target=_inference_worker, daemon=True, name="infer").start()
@@ -188,6 +198,11 @@ async def _lifespan(app: FastAPI):
         if _calibrator is not None:
             try:
                 _persist_calibration(_calibrator)
+            except Exception:
+                pass
+        if _forwarder is not None:
+            try:
+                _forwarder.stop()
             except Exception:
                 pass
         if _event_store is not None:
@@ -355,8 +370,11 @@ async def _write_guard(request, call_next):
 @app.get("/cam/{cam_id}", response_class=HTMLResponse)
 @app.get("/camera/{cam_id}", response_class=HTMLResponse)
 async def camera_page(cam_id: int) -> HTMLResponse:
+    # no-store: a phone that cached an older camera.html would keep using the
+    # old send/backpressure logic and silently ignore server tune messages.
     html = (STATIC / "camera.html").read_text()
-    return HTMLResponse(html.replace("{{CAM_ID}}", str(cam_id)))
+    return HTMLResponse(html.replace("{{CAM_ID}}", str(cam_id)),
+                        headers={"Cache-Control": "no-store"})
 
 
 # Slots the operator removed while the server runs. A phone page reconnects
@@ -364,6 +382,32 @@ async def camera_page(cam_id: int) -> HTMLResponse:
 # straight back. Re-adding the stream (POST /api/streams) clears the entry.
 _removed_cams: set[int] = set()
 _ws_conns: dict[int, WebSocket] = {}
+_tuner = UplinkTuner()          # reconfigured from cfg["ingest"] at startup
+_forwarder: AlertForwarder | None = None
+_SEVERITY_RANK = {"Info": 0, "Low": 1, "Medium": 2, "High": 3, "Critical": 4}
+
+
+def _camera_identities() -> dict:
+    """{cam_id: {name, lat, lon}} from the stream config, so an event carries
+    the camera's name and position rather than an index a recipient cannot
+    resolve."""
+    out = {}
+    for s in (cfg.get("streams") or []):
+        try:
+            cid = int(s.get("id"))
+        except (TypeError, ValueError):
+            continue
+        out[cid] = {"name": s.get("name") or f"CAM-{cid:02d}",
+                    "lat": s.get("lat"), "lon": s.get("lon")}
+    return out
+
+
+def _start_forwarder(store) -> None:
+    global _forwarder
+    if _forwarder is not None:
+        return
+    _forwarder = AlertForwarder(store, cfg.get("alerts") or {})
+    _forwarder.start()
 
 
 @app.websocket("/ws/camera/{cam_id}")
@@ -386,6 +430,27 @@ async def camera_ws(ws: WebSocket, cam_id: int) -> None:
                 break
             if (data := msg.get("bytes")) is not None:
                 cap.push_frame(data)
+                # Credit the sender one slot back. The phone holds at most
+                # ingest.max_in_flight unacked frames, which bounds end-to-end
+                # latency by construction: it cannot outrun the path, however
+                # slow the link. ws.bufferedAmount cannot do this — it goes to
+                # zero the moment the kernel accepts the bytes, while they sit
+                # for seconds in the socket and Wi-Fi driver queues.
+                await ws.send_text('{"type":"ack"}')
+                # Steer this phone's resolution/fps/quality from the latency we
+                # just measured. decide() self-limits to ~1 Hz, so calling it
+                # per frame costs a comparison. Done here, in the socket's own
+                # task, rather than from the muxer thread — no cross-loop hop.
+                _tuner.observe(cam_id, cap.latency_ms, cap.delivered_fps,
+                               cap.clock_ok)
+                for tgt, tune in _tuner.decide().items():
+                    sock = _ws_conns.get(tgt)
+                    if sock is None:
+                        continue
+                    try:
+                        await sock.send_text(json.dumps(tune))
+                    except Exception:
+                        logger.debug("CAM-%02d: could not deliver tune", tgt)
             elif (text := msg.get("text")) is not None:
                 try:
                     info = json.loads(text)
@@ -410,6 +475,7 @@ async def camera_ws(ws: WebSocket, cam_id: int) -> None:
         # raced ahead of this teardown keeps its own live state.
         if _ws_conns.get(cam_id) is ws:
             _ws_conns.pop(cam_id, None)
+            _tuner.forget(cam_id)
         if cap.close(generation):
             logger.info("CAM-%02d disconnected (%d frames received)",
                         cam_id, cap.frames_received)
@@ -1160,12 +1226,128 @@ async def evidence_recent(limit: int = 50):
 
 @app.get("/api/events")
 async def list_events(limit: int = 100, cam_id: int | None = None,
-                      level: str | None = None, since: float | None = None):
+                      level: str | None = None, since: float | None = None,
+                      severity: str | None = None, category: str | None = None,
+                      since_id: str | None = None):
+    """Incident feed.
+
+    `since_id` is the integration cursor: pass the last `event_id` you saw and
+    receive everything after it, oldest-first. Unlike a timestamp filter it
+    cannot skip or double-count across a reconnect, because event ids are
+    unique and monotonic — that is what makes the feed resumable for a
+    command-and-control client.
+    """
     if _event_store is None:
         return JSONResponse({"events": [], "counts": {}, "available": False})
-    rows = await asyncio.to_thread(_event_store.query, limit, cam_id, level, since)
+    rows = await asyncio.to_thread(
+        _event_store.query, limit, cam_id, level, since, severity, category,
+        since_id)
     counts = await asyncio.to_thread(_event_store.counts_by_level, since)
-    return JSONResponse({"events": rows, "counts": counts, "available": True})
+    body = {"events": rows, "counts": counts, "available": True}
+    if rows:
+        body["next_since_id"] = (rows[-1] if since_id else rows[0])["event_id"]
+    return JSONResponse(body)
+
+
+@app.get("/api/events/stream")
+async def stream_events(since_id: str | None = None, severity: str | None = None,
+                        category: str | None = None):
+    """Server-sent events — the push channel a C2 system subscribes to.
+
+    SSE rather than a WebSocket: it is one-way (which is all this needs),
+    survives proxies that break WS upgrades, reconnects on its own, and a judge
+    can demonstrate it with a single `curl -N`. Resumes from `since_id`, or
+    from the present if omitted.
+    """
+    if _event_store is None:
+        return JSONResponse({"error": "event store unavailable"}, status_code=503)
+
+    async def gen():
+        cursor = since_id
+        if cursor is None:
+            latest = await asyncio.to_thread(_event_store.query, 1)
+            cursor = latest[0]["event_id"] if latest else ""
+        yield f": connected, cursor={cursor}\n\n"
+        idle = 0.0
+        while True:
+            rows = await asyncio.to_thread(
+                _event_store.query, 200, None, None, None, severity, category,
+                cursor or None)
+            if not rows and not cursor:
+                # No cursor and nothing yet: wait for the first event.
+                rows = []
+            for r in rows:
+                cursor = r["event_id"]
+                yield (f"id: {cursor}\nevent: {r.get('category','event')}\n"
+                       f"data: {json.dumps(event_payload(r))}\n\n")
+            idle = 0.0 if rows else idle + 1.0
+            if idle >= 15.0:
+                idle = 0.0
+                yield ": keep-alive\n\n"     # stop an idle proxy timing us out
+            await asyncio.sleep(1.0)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-store",
+                                      "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/events/{event_id}/ack")
+async def ack_event(event_id: str, request: Request):
+    """Acknowledge an alert. Persisted and hash-chained — who accepted
+    responsibility for an incident, and when, is evidence in its own right, so
+    it cannot live only in the console's memory."""
+    if _event_store is None:
+        return JSONResponse({"error": "event store unavailable"}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    operator = str((body or {}).get("operator") or "").strip()
+    if not operator:
+        return JSONResponse({"error": "operator is required"}, status_code=400)
+    note = str((body or {}).get("note") or "")
+    row = await asyncio.to_thread(_event_store.ack, event_id, operator, note)
+    if row is None:
+        return JSONResponse({"error": "unknown event"}, status_code=404)
+    if not row.get("ack_hash"):
+        h = _chain_reader().append({
+            "type": "ack", "event_id": event_id, "operator": operator,
+            "note": note, "acked_at": row.get("acked_at"),
+            "cam_id": row.get("cam_id"), "severity": row.get("severity"),
+            "category": row.get("category"), "of_hash": row.get("ev_hash"),
+        })
+        await asyncio.to_thread(_event_store.set_ack_hash, event_id, h)
+        row["ack_hash"] = h
+    return JSONResponse({"ok": True, "event": row})
+
+
+@app.get("/api/events/export")
+async def export_events(fmt: str = "csv", since: float | None = None,
+                        until: float | None = None, limit: int = 1000,
+                        cam_id: int | None = None, severity: str | None = None,
+                        category: str | None = None):
+    """The shift report. A border force asks for this on day one and there was
+    no way to produce it."""
+    if _event_store is None:
+        return JSONResponse({"error": "event store unavailable"}, status_code=503)
+    rows = await asyncio.to_thread(
+        _event_store.query, limit, cam_id, None, since, severity, category,
+        None, until, True)
+    if fmt.lower() == "json":
+        return JSONResponse({"events": rows, "count": len(rows)})
+    cols = ["event_id", "ts_utc", "site_id", "post_name", "cam_id", "cam_name",
+            "lat", "lon", "severity", "category", "score", "persons", "vehicles",
+            "ev_hash", "acked_at", "acked_by", "ack_note"]
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(cols + ["details"])
+    for r in rows:
+        w.writerow([r.get(c, "") if r.get(c) is not None else "" for c in cols]
+                   + [json.dumps(r.get("details") or {})])
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    return Response(buf.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition":
+                             f'attachment; filename="ibvap_events_{stamp}.csv"'})
 
 
 # ── Event-triggered ANPR results ────────────────────────────────────────────
@@ -1522,6 +1704,9 @@ async def status():
         "face": (_detector.face.status()
                  if _detector is not None and getattr(_detector, "face", None)
                  else {"enabled": False}),
+        "uplink": _tuner.status(),
+        "alerts": (_forwarder.status() if _forwarder is not None
+                   else {"enabled": False}),
         "face_results": (_detector.face_results.status()
                          if _detector is not None and getattr(_detector, "face_results", None)
                          else {"enabled": False}),
@@ -1530,6 +1715,10 @@ async def status():
             "enabled": bool(cfg.get("geofence", {}).get("enabled")),
             "fences": _geofence_fences,     # {cam_id: [{id,kind,points,label,direction}]}
             "active": _geofence_active,     # {cam_id: {fence_id: is_breaching}}
+            # "how many crossed tonight" and "is anyone standing at the fence" —
+            # the two questions a post actually asks, which nothing could answer.
+            "crossings": _geofence_crossings,
+            "dwelling": _geofence_dwelling,
         },
         "learning": ({**_harvester.status(),
                       "calibration": (_calibrator.status() if _calibrator else {"enabled": False}),
@@ -1683,8 +1872,10 @@ def _inference_worker() -> None:
     _stats["switching"] = False
     risk_engine = RiskEngine(cfg)
     evidence = EvidenceChain(cfg["evidence"]["hash_chain_path"])
-    store = EventStore(cfg["evidence"]["db_path"])
+    store = EventStore(cfg["evidence"]["db_path"], site=cfg.get("site") or {})
+    store.set_cameras(_camera_identities())
     _event_store = store
+    _start_forwarder(store)
     geofence = GeoFenceEngine(cfg)
     geofence.load()
     gf_enabled = bool(cfg.get("geofence", {}).get("enabled"))
@@ -1855,16 +2046,28 @@ def _inference_worker() -> None:
             if gf_enabled and (sr.inferred or gf_eval_on_track):
                 new_breaches = geofence.evaluate(sr)
                 geofence.prune(sr.cam_id, live_ids)
+                global _geofence_crossings, _geofence_dwelling
+                _geofence_crossings = geofence.crossing_counts()
+                _geofence_dwelling = geofence.dwelling()
             if sr.inferred:
                 snapshots.prune(sr.cam_id, live_ids)
             zones = geofence.active_zones(sr.cam_id)
             _geofence_active[sr.cam_id] = zones
             _geofence_fences[sr.cam_id] = geofence.public_for(sr.cam_id)
             breach_now = any(zones.values())
-            breach_zones = [f.label or f.id
-                            for f in geofence.fences_for(sr.cam_id) if zones.get(f.id)]
+            breached = [f for f in geofence.fences_for(sr.cam_id) if zones.get(f.id)]
+            breach_zones = [f.label or f.id for f in breached]
             if breach_now:
-                ra.level, ra.score = "Critical", max(ra.score, 90.0)
+                # Take the worst severity among the fences actually breached,
+                # rather than forcing Critical for every zone — a counting line
+                # is not a perimeter wire.
+                worst = max((f.severity for f in breached), default="Critical",
+                            key=lambda s: _SEVERITY_RANK.get(s, 4))
+                if _SEVERITY_RANK.get(worst, 4) >= _SEVERITY_RANK["Critical"]:
+                    ra.level, ra.score = "Critical", max(ra.score, 90.0)
+                elif _SEVERITY_RANK.get(worst, 4) >= _SEVERITY_RANK["High"]:
+                    ra.level = "Critical" if ra.level == "Critical" else "High"
+                    ra.score = max(ra.score, 70.0)
 
             # ── Overlay FIRST, so any snapshot taken below carries the boxes,
             #    skeleton, fence lines and banner. NO JPEG encoding here — the
@@ -1879,8 +2082,13 @@ def _inference_worker() -> None:
             _draw_fences(frame_out, _geofence_fences.get(sr.cam_id, []), zones)
             if latency_ms:
                 late = latency_ms >= 1500
-                txt = (f"NET {latency_ms/1000:.1f}s  DELAYED" if late
-                       else f"NET {latency_ms} ms")
+                # Show the rung alongside the delay, so an operator watching a
+                # demo can tell "the link is bad and we already backed off"
+                # apart from "something is wrong" — the two look identical
+                # otherwise, and last time this was only diagnosed afterwards.
+                rung = _tuner.rung(sr.cam_id)
+                txt = (f"NET {latency_ms/1000:.1f}s DELAYED  {rung.label}" if late
+                       else f"NET {latency_ms} ms  {rung.label}")
                 scale = 0.62 if late else 0.5
                 (tw, _), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
                 _draw_label(frame_out, txt, (frame_out.shape[1] - tw - 12, 24),
@@ -1907,28 +2115,45 @@ def _inference_worker() -> None:
             #    moment (data/snapshots/<cam_id>/). The image sha256 is embedded
             #    in the breach record, so the file is tamper-evident. ──────────
             for b in new_breaches:
+                loiter = b.event == "loiter"
+                reason = "loiter" if loiter else "breach"
                 snap = None
-                if snapshots.should_capture(sr.cam_id, b.track_id, "breach"):
+                if snapshots.should_capture(sr.cam_id, b.track_id, reason):
                     snap = snapshots.capture(
                         sr.cam_id, frame_out, sr.frame, "breach",
                         {"detail": b.fence.label or b.fence.id, "track_id": b.track_id})
-                bev = {"cam_id": sr.cam_id, "type": "breach",
+                # Severity now comes from the fence. A perimeter wire and a
+                # counting line across an approach road are not the same alarm,
+                # and one flat Critical for both is how an operator learns to
+                # ignore it.
+                sev = b.fence.severity
+                bev = {"cam_id": sr.cam_id, "type": reason,
                        "fence_id": b.fence.id, "fence_label": b.fence.label,
                        "fence_kind": b.fence.kind, "track_id": b.track_id,
                        "class_name": b.class_name, "direction": b.direction,
+                       "crossing": b.fence.label_direction(b.direction) or None,
                        "ground_point": [round(x, 4) for x in b.ground_point],
-                       "level": "Critical",
+                       "level": sev,
                        "evidence_file": (snap or {}).get("file"),
                        "sha256": (snap or {}).get("sha256")}
+                if loiter:
+                    bev["elapsed_s"] = b.elapsed_s
                 bh = evidence.append(bev)
-                store.log(sr.cam_id, "Breach", ra.score,
-                          sr.person_count, sr.vehicle_count, bev, bh)
+                store.log(sr.cam_id, sev, ra.score,
+                          sr.person_count, sr.vehicle_count, bev, bh,
+                          category="loiter" if loiter else "intrusion")
                 if snap is not None:
                     snap["ev_hash"] = bh
                     snapshots.record(snap)
-                logger.warning("CAM-%02d BREACH  fence=%s  track=%d  %s  hash=%s…",
-                               sr.cam_id, b.fence.label or b.fence.id,
-                               b.track_id, b.fence.kind, bh[:12])
+                if loiter:
+                    logger.warning("CAM-%02d LOITERING  fence=%s  track=%d  %.0fs  hash=%s…",
+                                   sr.cam_id, b.fence.label or b.fence.id,
+                                   b.track_id, b.elapsed_s, bh[:12])
+                else:
+                    logger.warning("CAM-%02d BREACH  fence=%s  track=%d  %s %s hash=%s…",
+                                   sr.cam_id, b.fence.label or b.fence.id,
+                                   b.track_id, b.fence.kind,
+                                   b.fence.label_direction(b.direction), bh[:12])
 
             # ── Malicious posture (crouch / lying) → snapshot + evidence at
             #    "Posture" severity. Does NOT force Critical unless
@@ -1946,8 +2171,9 @@ def _inference_worker() -> None:
                            "evidence_file": (snap or {}).get("file"),
                            "sha256": (snap or {}).get("sha256")}
                     ph = evidence.append(pev)
-                    store.log(sr.cam_id, "Posture", ra.score,
-                              sr.person_count, sr.vehicle_count, pev, ph)
+                    store.log(sr.cam_id, "High", ra.score,
+                              sr.person_count, sr.vehicle_count, pev, ph,
+                              category="posture")
                     if snap is not None:
                         snap["ev_hash"] = ph
                         snapshots.record(snap)
@@ -1967,7 +2193,8 @@ def _inference_worker() -> None:
                     }
                     ev_hash = evidence.append(event)
                     store.log(sr.cam_id, ra.level, ra.score,
-                              sr.person_count, sr.vehicle_count, event, ev_hash)
+                              sr.person_count, sr.vehicle_count, event, ev_hash,
+                              category="risk")
                     logger.warning("CAM-%02d %s  score=%.1f  hash=%s…",
                                    sr.cam_id, ra.level, ra.score, ev_hash[:12])
 
@@ -2015,7 +2242,8 @@ def _inference_worker() -> None:
                       "confidence": round(pr.conf, 2), "verified": pr.valid,
                       "track": pr.track_id}
                 h = evidence.append(ev)
-                store.log(pr.cam_id, "Plate", pr.conf * 100, 0, 1, ev, h)
+                store.log(pr.cam_id, "Info", pr.conf * 100, 0, 1, ev, h,
+                          category="plate")
                 if _harvester is not None:
                     _harvester.submit_plate(pr.cam_id, frames_by_cam.get(pr.cam_id), pr)
                 if detector.anpr_results is not None:
@@ -2064,7 +2292,8 @@ def _inference_worker() -> None:
                       "evidence_file": (snap or {}).get("file"),
                       "sha256": (snap or {}).get("sha256")}
                 h = evidence.append(ev)
-                store.log(we.cam_id, "Critical", 94.0, 0, 0, ev, h)
+                store.log(we.cam_id, "Critical", 94.0, 0, 0, ev, h,
+                          category="weapon")
                 if snap is not None:
                     snap["ev_hash"] = h
                     snapshots.record(snap)
@@ -2093,7 +2322,8 @@ def _inference_worker() -> None:
                           "sha256": shas[0] if shas else None}
                     h = evidence.append(ev)
                     rec["ev_hash"] = h
-                    store.log(rec["cam_id"], "Critical", 96.0, 0, 0, ev, h)
+                    store.log(rec["cam_id"], "Critical", 96.0, 0, 0, ev, h,
+                              category="face_match")
                     logger.warning("CAM-%02d CRIMINAL SPOTTED  name=%s  track=%d  sim=%.2f  hash=%s...",
                                    rec["cam_id"], rec.get("matched_name"), rec["track_id"],
                                    rec.get("similarity", 0.0), h[:12])

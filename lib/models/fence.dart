@@ -3,6 +3,15 @@
 /// Geometry is normalised 0..1 image coordinates for one camera:
 ///   * `polygon` — no-go zone, 3+ points (open ring)
 ///   * `line`    — tripwire polyline, 2+ points (each consecutive pair a segment)
+///
+/// The console saves by read-modify-write of the WHOLE fence list
+/// (`POST /api/fences` replaces the set), so anything this class fails to carry
+/// through [fromJson] → [toJson] is silently erased from every fence on every
+/// save. That is exactly how the per-fence behaviour fields were being wiped.
+/// [extra] exists so that can never happen again: it holds every key this
+/// client does not itself manage and writes it back untouched, which keeps
+/// server-owned fields (`created_at`) and any field added to the backend later
+/// intact even before this class learns about it.
 class Fence {
   Fence({
     this.id,
@@ -13,7 +22,23 @@ class Fence {
     this.targets = const ['any'],
     this.label = '',
     this.enabled = true,
+    this.severity = 'Critical',
+    this.loiterAfterS = 0,
+    this.armedFrom = '',
+    this.armedTo = '',
+    this.inbound = '',
+    this.extra = const {},
   });
+
+  /// Alert severity choices, in the order the server ranks them.
+  static const severities = ['Info', 'Low', 'Medium', 'High', 'Critical'];
+
+  /// Keys this class reads and writes itself; everything else goes to [extra].
+  static const _known = {
+    'id', 'cam_id', 'kind', 'points', 'direction', 'targets', 'label',
+    'enabled', 'severity', 'loiter_after_s', 'armed_from', 'armed_to',
+    'inbound',
+  };
 
   final String? id;
   final int camId;
@@ -24,6 +49,26 @@ class Fence {
   final String label;
   final bool enabled;
 
+  /// How serious a breach of this fence is. A perimeter wire is Critical; a
+  /// counting line across an approach road is not the same alarm.
+  final String severity;
+
+  /// Raise a separate loiter alert once a target has been inside a zone this
+  /// long, in seconds. 0 = off. Zones only.
+  final double loiterAfterS;
+
+  /// Local-time arming window, 24-hour "HH:MM". Both empty = always armed.
+  final String armedFrom;
+  final String armedTo;
+
+  /// Which line-crossing direction means "into our territory": '' (unset),
+  /// 'a2b' or 'b2a'. There is no camera calibration, so this is whatever the
+  /// person who drew the line says it is. Lines only.
+  final String inbound;
+
+  /// Keys the console does not manage, preserved verbatim across a save.
+  final Map<String, dynamic> extra;
+
   bool get isLine => kind == 'line';
 
   factory Fence.fromJson(Map<String, dynamic> j) {
@@ -33,6 +78,7 @@ class Fence {
         pts.add(((p[0] as num).toDouble(), (p[1] as num).toDouble()));
       }
     }
+    final loiter = j['loiter_after_s'];
     return Fence(
       id: j['id']?.toString(),
       camId: (j['cam_id'] as num?)?.toInt() ?? 0,
@@ -44,10 +90,22 @@ class Fence {
           .toList(),
       label: (j['label'] ?? '').toString(),
       enabled: j['enabled'] != false,
+      severity: (j['severity'] ?? 'Critical').toString(),
+      loiterAfterS: loiter is num ? loiter.toDouble() : 0,
+      armedFrom: (j['armed_from'] ?? '').toString(),
+      armedTo: (j['armed_to'] ?? '').toString(),
+      inbound: (j['inbound'] ?? '').toString(),
+      extra: {
+        for (final e in j.entries)
+          if (!_known.contains(e.key)) e.key: e.value,
+      },
     );
   }
 
   Map<String, dynamic> toJson() => {
+        // Unknown keys first, so a key this class manages can never be
+        // shadowed by a stale copy of itself sitting in [extra].
+        ...extra,
         if (id != null) 'id': id,
         'cam_id': camId,
         'kind': kind,
@@ -59,6 +117,11 @@ class Fence {
         'targets': targets,
         'label': label,
         'enabled': enabled,
+        'severity': severity,
+        'loiter_after_s': loiterAfterS,
+        'armed_from': armedFrom,
+        'armed_to': armedTo,
+        'inbound': inbound,
       };
 
   Fence copyWith({
@@ -70,6 +133,12 @@ class Fence {
     List<String>? targets,
     String? label,
     bool? enabled,
+    String? severity,
+    double? loiterAfterS,
+    String? armedFrom,
+    String? armedTo,
+    String? inbound,
+    Map<String, dynamic>? extra,
   }) =>
       Fence(
         id: id ?? this.id,
@@ -80,6 +149,12 @@ class Fence {
         targets: targets ?? this.targets,
         label: label ?? this.label,
         enabled: enabled ?? this.enabled,
+        severity: severity ?? this.severity,
+        loiterAfterS: loiterAfterS ?? this.loiterAfterS,
+        armedFrom: armedFrom ?? this.armedFrom,
+        armedTo: armedTo ?? this.armedTo,
+        inbound: inbound ?? this.inbound,
+        extra: extra ?? this.extra,
       );
 }
 

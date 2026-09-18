@@ -42,10 +42,14 @@ def _cfg(d, **over) -> dict:
     return {"face_results": base}
 
 
-def _hit(name="Alice", on_watchlist=True, sim=0.6) -> FaceHit:
+def _hit(name="Alice", on_watchlist=True, sim=0.6, trusted=True,
+         source="face", quality=0.5, crop=True) -> FaceHit:
     return FaceHit(person_track=1, bbox=(0, 0, 5, 5), det_score=0.9,
                   matched_id=(name.lower() if name else None), matched_name=name,
-                  similarity=sim, on_watchlist=on_watchlist)
+                  similarity=sim, on_watchlist=on_watchlist, trusted=trusted,
+                  source=source, quality=quality,
+                  face_crop=(np.full((16, 16, 3), 200, np.uint8) if crop else None),
+                  person_crop=np.full((24, 40, 3), 120, np.uint8))
 
 
 # ── PersonArrivalTracker ────────────────────────────────────────────────────
@@ -161,10 +165,74 @@ def _():
     t.record((0, 1), 1000.0, None)
     t.record((0, 2), 1000.0, None)
     t.record((1, 1), 1000.0, None)
-    t.prune(0, live_track_ids={2})
+    t.prune(0, live_track_ids={2}, now=1000.0 + 99)   # well past prune_grace_s
     assert (0, 1) not in t._state       # dropped
     assert (0, 2) in t._state           # still live
     assert (1, 1) in t._state           # other camera untouched
+
+
+# ── regressions: the three bugs that made a live demo log nothing ───────────
+
+@case("REGRESSION: a burst whose window lapses off the due-list still finalizes")
+def _():
+    # wants_capture() and record()'s finish test are exact complements on the
+    # time window, so the tick the window expires the track stops being offered
+    # and record() is never called again. Without sweep_expired the burst sits
+    # un-finalized forever: no verdict, no alert, no evidence — which is
+    # exactly what a person standing still in front of the camera produced.
+    t = PersonArrivalTracker(burst_n=5, vote_min=3, attempt_window_s=8.0)
+    key = (0, 1)
+    for i in range(3):                      # 3 agreeing votes, short of burst_n=5
+        assert t.wants_capture(key, i, 1000.0 + i) is True
+        assert t.record(key, 1000.0 + i, _hit(name="Alice")) is None
+    assert t.wants_capture(key, 9, 1009.0) is False      # window lapsed
+    out = t.sweep_expired(1009.5)
+    assert len(out) == 1
+    v = out[0]
+    assert v.on_watchlist is True and v.matched_name == "Alice" and v.votes == 3
+
+
+@case("REGRESSION: sweep_expired leaves an already-decided burst alone")
+def _():
+    t = PersonArrivalTracker(burst_n=2, vote_min=1, attempt_window_s=8.0)
+    key = (0, 1)
+    t.wants_capture(key, 0, 1000.0)
+    t.record(key, 1000.0, _hit())
+    assert t.record(key, 1000.1, _hit()) is not None      # finalized on burst_n
+    assert t.sweep_expired(1100.0) == []                  # not decided twice
+
+
+@case("REGRESSION: one missed detection frame does not wipe the burst")
+def _():
+    # prune() used to drop state the instant a track was absent from a single
+    # frame's detections, resetting hits to 0 and first_ts to now. A detection
+    # miss is routine on a blurry or laggy stream, so burst_n was never reached.
+    t = PersonArrivalTracker(prune_grace_s=2.0)
+    key = (0, 1)
+    t.wants_capture(key, 0, 1000.0)
+    t.record(key, 1000.0, _hit())
+    t.prune(0, live_track_ids=set(), now=1000.5)         # missed one frame
+    assert key in t._state and len(t._state[key].hits) == 1
+    t.prune(0, live_track_ids={1}, now=1001.0)           # back again
+    assert key in t._state
+    t.prune(0, live_track_ids=set(), now=1004.0)         # gone past the grace
+    assert key not in t._state
+
+
+@case("REGRESSION: an untrusted reading never votes but still spends an attempt")
+def _():
+    # Always-capture lets low-confidence faces through to the writer. They must
+    # not be able to name anyone, or always-capture would trade false negatives
+    # for false "CRIMINAL SPOTTED" alerts.
+    t = PersonArrivalTracker(burst_n=5, vote_min=1, attempt_window_s=8.0)
+    key = (0, 1)
+    t.wants_capture(key, 0, 1000.0)
+    for i in range(4):
+        t.record(key, 1000.0 + i * 0.1, _hit(trusted=False, on_watchlist=False))
+    assert t.attempts_so_far(key) == 4
+    assert len(t._state[key].hits) == 0                  # nothing vote-eligible
+    v = t.sweep_expired(1010.0)[0]
+    assert v.on_watchlist is False and v.of == 0
 
 
 @case("independent tracks / cameras don't interfere")
@@ -205,70 +273,109 @@ class _Verdict:
         self.on_watchlist = on_watchlist
 
 
-@case("capture_snapshot writes one jpg per burst tick and opens a pending record")
+@case("offer_candidate buffers without writing, and keeps only the best crop")
 def _():
     d = tempfile.mkdtemp()
     try:
         w = FaceResultWriter(_cfg(d))
-        r0 = w.capture_snapshot(0, _frame(), 7, 0, {"detail": "alice"}, now=1000.0)
-        r1 = w.capture_snapshot(0, _frame(), 7, 1, {"detail": "alice"}, now=1000.1)
-        assert r0 is not None and r1 is not None
-        assert r0["file"] != r1["file"]
-        assert (Path(d) / r0["file"]).is_file() and (Path(d) / r1["file"]).is_file()
-        assert len(r0["sha256"]) == 64
+        box = (0, 0, 64, 64)
+        assert w.offer_candidate(0, 7, _hit(quality=0.30), {}, now=1000.0)
+        assert w.offer_candidate(0, 7, _hit(quality=0.80), {}, now=1000.1)
+        # Worse than the incumbent: counted, but must not displace it.
+        assert w.offer_candidate(0, 7, _hit(quality=0.40), {}, now=1000.2) is False
         assert w.status()["pending"] == 1
+        assert list(Path(d).glob("**/*.jpg")) == []            # nothing written yet
+        rec = w.flush_best(0, 7, _Verdict(), now=1000.5)
+        assert rec["face_quality"] == 0.80
+        assert rec["candidates_seen"] == 3
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
 
-@case("finalize completes the record with the verdict but does NOT write it (two-step handoff)")
+@case("flush_best writes face + person crops and completes the record (two-step handoff)")
 def _():
     d = tempfile.mkdtemp()
     try:
         w = FaceResultWriter(_cfg(d))
-        w.capture_snapshot(0, _frame(), 7, 0, {}, now=1000.0)
-        w.capture_snapshot(0, _frame(), 7, 1, {}, now=1000.1)
+        w.offer_candidate(0, 7, _hit(), {"detail": "alice"}, now=1000.0)
         v = _Verdict(matched_id="alice", matched_name="Alice", similarity=0.71,
                     votes=3, of=5, on_watchlist=True)
-        rec = w.finalize(0, 7, v, now=1000.5)
+        rec = w.flush_best(0, 7, v, now=1000.5)
         assert rec["matched_name"] == "Alice" and rec["on_watchlist"] is True
+        # files[0] is the face, files[1] the person context — server.py's
+        # evidence row and the Flutter panel both read files[0].
         assert len(rec["files"]) == 2
+        assert rec["files"][0].endswith("_face.jpg")
+        assert rec["files"][1].endswith("_person.jpg")
+        assert all((Path(d) / f).is_file() for f in rec["files"])
         assert not (Path(d) / "0" / "index.jsonl").exists()   # record() not called yet
         assert w.status()["pending"] == 0
         rec["ev_hash"] = "deadbeef"
         w.record(rec)
-        lines = (Path(d) / "0" / "index.jsonl").read_text("utf-8").splitlines()
-        assert len(lines) == 1
-        row = json.loads(lines[0])
+        row = json.loads((Path(d) / "0" / "index.jsonl").read_text("utf-8").splitlines()[0])
         for k in ("ts", "cam_id", "track_id", "files", "sha256s", "matched_id",
-                  "matched_name", "similarity", "votes", "of", "on_watchlist", "ev_hash"):
+                  "matched_name", "similarity", "votes", "of", "on_watchlist",
+                  "ev_hash", "face_source", "face_quality", "face_bbox"):
             assert k in row, f"missing key {k}"
         assert row["ev_hash"] == "deadbeef"
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
 
-@case("finalize with no pending record returns None")
+@case("a real detected face always outranks a head_box guess, even a better-scoring one")
 def _():
     d = tempfile.mkdtemp()
     try:
         w = FaceResultWriter(_cfg(d))
-        assert w.finalize(0, 99, _Verdict()) is None
+        box = (0, 0, 64, 64)
+        guess = _hit(name=None, on_watchlist=False, trusted=False,
+                     source="head_box", quality=0.90)
+        real = _hit(quality=0.20)
+        assert w.offer_candidate(0, 7, guess, {}, now=1000.0)
+        assert w.offer_candidate(0, 7, real, {}, now=1000.1)
+        rec = w.flush_best(0, 7, _Verdict(), now=1000.5)
+        assert rec["face_source"] == "face" and rec["face_quality"] == 0.20
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
 
-@case("sweep_timeouts finalizes an abandoned burst as unknown, keeping its pictures")
+@case("a person whose face was never detected still yields a head_box record")
 def _():
     d = tempfile.mkdtemp()
     try:
         w = FaceResultWriter(_cfg(d))
-        w.capture_snapshot(0, _frame(), 1, 0, {}, now=1000.0)
+        h = _hit(name=None, on_watchlist=False, sim=0.0, trusted=False,
+                 source="head_box", quality=0.12)
+        w.offer_candidate(0, 7, h, {}, now=1000.0)
+        rec = w.flush_best(0, 7, _Verdict(), now=1000.5)
+        assert rec is not None and rec["face_source"] == "head_box"
+        assert rec["on_watchlist"] is False and rec["matched_id"] is None
+        assert (Path(d) / rec["files"][0]).is_file()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@case("flush_best with no pending record returns None")
+def _():
+    d = tempfile.mkdtemp()
+    try:
+        w = FaceResultWriter(_cfg(d))
+        assert w.flush_best(0, 99, _Verdict()) is None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@case("sweep_timeouts flushes an abandoned burst as unknown, keeping its best crop")
+def _():
+    d = tempfile.mkdtemp()
+    try:
+        w = FaceResultWriter(_cfg(d))
+        w.offer_candidate(0, 1, _hit(), {}, now=1000.0)
         assert w.sweep_timeouts(now=1010.0, timeout_s=20.0) == []      # not stale yet
         out = w.sweep_timeouts(now=1025.0, timeout_s=20.0)
         assert len(out) == 1
         assert out[0]["matched_id"] is None and out[0]["on_watchlist"] is False
-        assert len(out[0]["files"]) == 1
+        assert (Path(d) / out[0]["files"][0]).is_file()
         assert w.status()["pending"] == 0
     finally:
         shutil.rmtree(d, ignore_errors=True)
@@ -279,7 +386,8 @@ def _():
     d = tempfile.mkdtemp()
     try:
         w = FaceResultWriter(_cfg(d, enabled=False))
-        assert w.capture_snapshot(0, _frame(), 1, 0, {}) is None
+        assert w.offer_candidate(0, 1, _hit(), {}) is False
+        assert w.flush_best(0, 1, _Verdict()) is None
         assert list(Path(d).iterdir()) == []
     finally:
         shutil.rmtree(d, ignore_errors=True)

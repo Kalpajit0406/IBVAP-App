@@ -45,15 +45,26 @@ const CAM_ID  = {{CAM_ID}};
 const REQ_W = 1280, REQ_H = 720, REQ_FPS = 24;
 
 // ── Uplink budget ────────────────────────────────────────────────────────────
-// A mobile uplink is often 1–5 Mbps. 720p JPEG @ 24fps is ~10 Mbps, so the
-// WebSocket send buffer grows without bound and every frame the server sees is
-// seconds old. We therefore: downscale before encoding, cap the send rate, and
-// — the key fix — NEVER queue a frame while the socket already has one pending.
+// A mobile uplink is often 1–5 Mbps. 720p JPEG @ 24fps is ~10 Mbps, so without
+// backpressure the frames the server sees are seconds old. We downscale before
+// encoding, cap the send rate, and — the key fix — never hold more than
+// MAX_IN_FLIGHT frames the server has not acknowledged.
+//
+// This used to throttle on ws.bufferedAmount, which does NOT work: that counter
+// only measures bytes the browser has not yet handed to the OS. Once the kernel
+// accepts them into a multi-megabyte SO_SNDBUF and the Wi-Fi driver queue it
+// reads ~0, while those frames sit in the network for seconds. On a laptop
+// SoftAP hotspot — exactly the demo setup — the congestion branch therefore
+// never fired and latency grew to 10-15 s. TCP is strictly ordered, so nothing
+// downstream can drop-to-latest; the only cure is not sending in the first
+// place. A server ack per frame measures the whole path and is self-clocking:
+// latency is bounded by MAX_IN_FLIGHT / fps at any link speed.
 const SEND_W_MAX = 960;         // longest edge of the frame we transmit
 const SEND_FPS_HI = 20;         // when the link is keeping up
 const SEND_FPS_LO = 10;         // when it is congested
 const Q_HI = 0.55, Q_LO = 0.40; // JPEG quality, ditto
-const MAX_BUFFERED = 96 * 1024; // ~one frame; above this we skip capture entirely
+const MAX_IN_FLIGHT = 2;        // unacked frames allowed before we stop capturing
+const ACK_TIMEOUT_MS = 3000;    // a lost ack must not wedge the sender forever
 
 const preview  = document.getElementById('preview');
 const canvas   = document.getElementById('canvas');
@@ -66,6 +77,9 @@ const startBtn = document.getElementById('startbtn');
 let ws = null, negotiated = null, sendTimer = null, syncTimer = null;
 let clockOffset = 0;            // serverTime ≈ Date.now() + clockOffset
 let congested = false, skipStreak = 0, sentSinceTick = 0;
+let inFlight = 0, lastAckAt = 0;
+// Set by the server's "tune" message; 0 means "no opinion yet, use the defaults".
+let tuneFps = 0, tuneQ = 0, tuneLabel = '';
 let sendW = SEND_W_MAX, sendH = SEND_W_MAX * 9 / 16;
 
 function setStatus(text, state) { dot.className = 'dot ' + state; statusEl.textContent = text; }
@@ -90,9 +104,15 @@ function connect() {
   setStatus('Connecting to server…', 'wait');
   ws = new WebSocket(wsUrl());
   ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { setStatus(`Streaming — CAM-${String(CAM_ID).padStart(2,'0')}`, 'live'); sendHello(); };
+  ws.onopen = () => {
+    // Credits belong to the old socket; anything unacked on it is gone.
+    inFlight = 0; lastAckAt = 0; skipStreak = 0;
+    setStatus(`Streaming — CAM-${String(CAM_ID).padStart(2,'0')}`, 'live');
+    sendHello();
+  };
   ws.onclose = (ev) => {
     ws = null;
+    inFlight = 0; lastAckAt = 0;
     if (ev && ev.code === 4404) {
       // The operator removed this slot in the console; check back slowly.
       setStatus('This camera slot was removed by the operator.', 'error');
@@ -103,11 +123,21 @@ function connect() {
   };
   ws.onerror = () => setStatus('Connection error', 'error');
   ws.onmessage = (ev) => {
-    // Server replies to the hello with its clock; one-way delay (~tens of ms)
-    // is folded in as a small constant, fine for a lag indicator.
     try {
       const m = JSON.parse(ev.data);
-      if (m.type === 'synced' && typeof m.serverTime === 'number' && typeof m.t0 === 'number') {
+      if (m.type === 'ack') {
+        // One frame cleared the whole path. Free its credit.
+        if (inFlight > 0) inFlight--;
+        lastAckAt = Date.now();
+      } else if (m.type === 'tune') {
+        // The server measures our real end-to-end latency — which this page
+        // cannot see — and tells us what to send. Absolute state, not a delta,
+        // so a missed message is harmless: the next one re-asserts it.
+        applyTune(m);
+      } else if (m.type === 'synced' &&
+                 typeof m.serverTime === 'number' && typeof m.t0 === 'number') {
+        // Server replies to the hello with its clock; one-way delay (~tens of
+        // ms) is folded in as a small constant, fine for a lag indicator.
         const rtt = Date.now() - m.t0;
         clockOffset = m.serverTime + rtt / 2 - Date.now();
       }
@@ -126,16 +156,25 @@ function packFrame(jpegBuf) {
 function sendFrame() {
   if (!ws || ws.readyState !== WebSocket.OPEN || preview.readyState < 2) return;
 
-  // Backpressure: if the socket still holds the previous frame, the uplink is
-  // behind. Skip this capture rather than pile on — this is what keeps latency
-  // flat instead of growing to several seconds.
-  if (ws.bufferedAmount > MAX_BUFFERED) {
+  // A stalled server (or a dropped ack) must not stop the stream permanently:
+  // give the credit back after ACK_TIMEOUT_MS and carry on. Restarting the
+  // clock matters — otherwise a server that never acks at all would be
+  // refunded on every tick and we would be back to sending with no
+  // backpressure whatsoever. This way it degrades to a trickle instead.
+  if (inFlight > 0 && lastAckAt && Date.now() - lastAckAt > ACK_TIMEOUT_MS) {
+    inFlight = 0;
+    lastAckAt = Date.now();
+  }
+
+  // Backpressure: the server has not acknowledged the frames we already sent,
+  // so the path is behind. Skip this capture rather than pile on.
+  if (inFlight >= MAX_IN_FLIGHT) {
     skipStreak++;
     if (skipStreak === 6 && !congested) { congested = true; applyRate(); }
     updateDetail();
     return;
   }
-  if (skipStreak > 0 && ws.bufferedAmount < MAX_BUFFERED / 3) {
+  if (skipStreak > 0 && inFlight === 0) {
     skipStreak = 0;
     if (congested) { congested = false; applyRate(); }
   }
@@ -143,17 +182,43 @@ function sendFrame() {
   ctx.drawImage(preview, 0, 0, sendW, sendH);
   canvas.toBlob(blob => {
     if (!blob || !ws || ws.readyState !== WebSocket.OPEN) return;
-    if (ws.bufferedAmount > MAX_BUFFERED) return;      // re-check: toBlob is async
+    if (inFlight >= MAX_IN_FLIGHT) return;             // re-check: toBlob is async
     blob.arrayBuffer().then(buf => {
-      if (ws && ws.readyState === WebSocket.OPEN) { ws.send(packFrame(buf)); sentSinceTick++; }
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(packFrame(buf));
+        inFlight++;
+        if (!lastAckAt) lastAckAt = Date.now();
+        sentSinceTick++;
+      }
     });
-  }, 'image/jpeg', congested ? Q_LO : Q_HI);
+  }, 'image/jpeg', currentQ());
+}
+
+function applyTune(m) {
+  if (typeof m.w === 'number' && typeof m.h === 'number' &&
+      (m.w !== sendW || m.h !== sendH)) {
+    sendW = m.w; sendH = m.h;
+    canvas.width = sendW; canvas.height = sendH;
+  }
+  if (typeof m.fps === 'number') tuneFps = m.fps;
+  if (typeof m.q === 'number') tuneQ = m.q;
+  if (typeof m.label === 'string') tuneLabel = m.label;
+  applyRate();
+}
+
+function currentFps() {
+  if (tuneFps) return tuneFps;
+  return congested ? SEND_FPS_LO : SEND_FPS_HI;
+}
+
+function currentQ() {
+  if (tuneQ) return tuneQ;
+  return congested ? Q_LO : Q_HI;
 }
 
 function applyRate() {
   if (sendTimer) clearInterval(sendTimer);
-  const fps = congested ? SEND_FPS_LO : SEND_FPS_HI;
-  sendTimer = setInterval(sendFrame, 1000 / fps);
+  sendTimer = setInterval(sendFrame, 1000 / currentFps());
   setStatus(congested ? 'Link busy — reducing rate' : `Streaming — CAM-${String(CAM_ID).padStart(2,'0')}`,
             congested ? 'warn' : 'live');
   updateDetail();
@@ -166,11 +231,11 @@ function updateDetail() {
   const dt = (now - lastRateReport) / 1000;
   const outFps = dt > 0 ? sentSinceTick / dt : 0;
   if (dt >= 1) { sentSinceTick = 0; lastRateReport = now; }
-  const buffKB = ws ? (ws.bufferedAmount / 1024).toFixed(0) : '0';
   detailEl.innerHTML =
-    `<b>send</b> ${sendW}×${Math.round(sendH)} @ ${(congested ? SEND_FPS_LO : SEND_FPS_HI)}fps ` +
-    `q${congested ? Q_LO : Q_HI} &nbsp;·&nbsp; <b>out</b> ~${outFps.toFixed(0)}fps ` +
-    `&nbsp;·&nbsp; <b>buffer</b> ${buffKB} KB${congested ? ' ⚠' : ''}<br>` +
+    `<b>send</b> ${sendW}×${Math.round(sendH)} @ ${currentFps()}fps ` +
+    `q${currentQ()}${tuneLabel ? ` <i>(auto)</i>` : ''} ` +
+    `&nbsp;·&nbsp; <b>out</b> ~${outFps.toFixed(0)}fps ` +
+    `&nbsp;·&nbsp; <b>in flight</b> ${inFlight}/${MAX_IN_FLIGHT}${congested ? ' ⚠' : ''}<br>` +
     `<b>negotiated</b> ${n.width || '?'}×${n.height || '?'} @ ${(n.fps || 0).toFixed(0)}fps ` +
     `(server normalises to 1280×720)`;
 }

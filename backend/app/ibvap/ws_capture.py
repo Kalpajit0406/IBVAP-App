@@ -13,6 +13,15 @@ import numpy as np
 # Native-resolution frames kept per camera for ANPR plate crops (~0.2 s at 24 fps).
 NATIVE_BUFFER = 4
 
+# Drop a frame whose capture timestamp is older than this rather than spend a
+# decode on it. Set from config (ingest.max_frame_age_ms) at startup; 0 disables.
+MAX_FRAME_AGE_MS = 1200.0
+
+
+def set_max_frame_age_ms(ms: float) -> None:
+    global MAX_FRAME_AGE_MS
+    MAX_FRAME_AGE_MS = max(0.0, float(ms))
+
 logger = logging.getLogger("ibvap.capture")
 
 
@@ -80,6 +89,20 @@ class WebSocketCapture:
         self._have_offset = False
         self._latency_ms = 0.0
         self._latency_raw_ms = 0.0
+
+        # ── Stale-frame dropping, and the clock trust that gates it ─────────
+        # Dropping by capture age is only safe while the phone's clock actually
+        # agrees with ours. A phone whose clock is badly wrong would otherwise
+        # have every one of its frames discarded and go permanently black, which
+        # is a far worse failure than the latency this is meant to fix. So:
+        # require a majority of recent samples to look sane, and if dropping
+        # ever starts eating nearly everything, switch it off and let the
+        # arrival-time STALE_AFTER check be the net instead.
+        self.frames_stale = 0
+        self._clock_samples: collections.deque = collections.deque(maxlen=50)
+        self._drop_window: collections.deque = collections.deque(maxlen=60)
+        self._drop_disabled_until = 0.0
+        self._logged_clock_distrust = False
 
     # ── Connection lifecycle (called from the WebSocket handler) ──────────────
     def open(self) -> int:
@@ -192,11 +215,49 @@ class WebSocketCapture:
                            if self.neg_w else "—"),
             "delivered_fps": self.delivered_fps,
             "latency_ms": self.latency_ms,
+            "clock_ok": self.clock_ok,
+            "frames_stale": self.frames_stale,
             "resized": self._resized_count,
             "normalised_to": f"{self._norm_w}x{self._norm_h}",
         }
 
     # ── Frame flow ───────────────────────────────────────────────────────────
+    def _note_clock_sample(self, raw_ms: float) -> None:
+        """A latency reading is 'sane' if it could plausibly be a real network
+        delay. A phone whose clock is off by hours produces wildly negative or
+        enormous values, and a majority of those means we cannot trust ages."""
+        self._clock_samples.append(-500.0 <= raw_ms <= 30000.0)
+
+    @property
+    def clock_ok(self) -> bool:
+        if not self._have_offset or not self._clock_samples:
+            return False
+        return (sum(self._clock_samples) / len(self._clock_samples)) >= 0.5
+
+    def _should_drop_stale(self, age_ms: float) -> bool:
+        if MAX_FRAME_AGE_MS <= 0 or not self.clock_ok:
+            return False
+        now = time.monotonic()
+        if now < self._drop_disabled_until:
+            return False
+        drop = age_ms > MAX_FRAME_AGE_MS
+        self._drop_window.append(drop)
+        # If nearly everything is "stale" the offset is probably skewed rather
+        # than the link being that bad. Back off for 30 s rather than blind the
+        # camera; the operator still sees the latency figure climbing.
+        if len(self._drop_window) == self._drop_window.maxlen and \
+                sum(self._drop_window) / len(self._drop_window) > 0.9:
+            self._drop_disabled_until = now + 30.0
+            self._drop_window.clear()
+            if not self._logged_clock_distrust:
+                self._logged_clock_distrust = True
+                logger.warning(
+                    "CAM-%02d dropping almost every frame as stale — suspect a "
+                    "skewed phone clock, not the link. Age-dropping paused 30 s.",
+                    self.cam_id)
+            return False
+        return drop
+
     def push_frame(self, data: bytes) -> None:
         # Frame wire format from the browser: [8-byte LE capture-ms | JPEG].
         # A bare JPEG starts with the SOI marker FF D8; a timestamped frame has
@@ -210,18 +271,28 @@ class WebSocketCapture:
         else:
             jpeg_bytes = data
 
+        # Age is checked BEFORE decoding — imdecode is the expensive part, and a
+        # frame this old is going to be thrown away regardless. Note the queue's
+        # own drop-to-latest cannot help here: TCP is strictly ordered, so a
+        # backlog must be received and decoded before a fresh frame is even
+        # reachable. Skipping the decode is what lets the server catch up.
+        if cap_ms is not None and self._have_offset:
+            raw = time.time() * 1000.0 - (cap_ms + self._clock_offset_ms)
+            self._latency_raw_ms = raw
+            self._note_clock_sample(raw)
+            # Clamp absurd values from a phone with a wildly wrong clock.
+            clamped = max(0.0, min(raw, 30000.0))
+            self._latency_ms = clamped if self._latency_ms == 0.0 else \
+                0.7 * self._latency_ms + 0.3 * clamped
+            if self._should_drop_stale(raw):
+                self.frames_stale += 1
+                self._last_frame_at = time.monotonic()   # still a live camera
+                return
+
         arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
         frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if frame is None:
             return
-
-        if cap_ms is not None and self._have_offset:
-            raw = time.time() * 1000.0 - (cap_ms + self._clock_offset_ms)
-            self._latency_raw_ms = raw
-            # Clamp absurd values from a phone with a wildly wrong clock.
-            raw = max(0.0, min(raw, 30000.0))
-            self._latency_ms = raw if self._latency_ms == 0.0 else \
-                0.7 * self._latency_ms + 0.3 * raw
 
         # ── Server-side normalisation ──────────────────────────────────────
         h, w = frame.shape[:2]

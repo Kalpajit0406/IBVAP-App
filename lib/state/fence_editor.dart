@@ -29,10 +29,46 @@ class FenceEditor extends ChangeNotifier {
   String targets = 'any'; // 'any' | 'person' | 'vehicle'
   String direction = 'both'; // 'both' | 'a2b' | 'b2a'
   String label = '';
+  String severity = 'Critical'; // Fence.severities
+  // The three free-text settings are held as typed and only interpreted at
+  // save time, so half-typed input ("2", "22:") is never mis-parsed mid-edit.
+  String loiterText = ''; // seconds; blank / 0 = off
+  String armedFrom = ''; // "HH:MM" local time; blank = always armed
+  String armedTo = '';
+  String inbound = ''; // '' | 'a2b' | 'b2a'  (lines only)
   final List<(double, double)> draft = [];
 
+  /// Bumped whenever a draft is loaded, started or cancelled. The form's text
+  /// fields watch it to know when to overwrite what they show; comparing the
+  /// text itself instead would fight the user while they type.
+  int revision = 0;
+
+  static final _hhmm = RegExp(r'^([01]\d|2[0-3]):[0-5]\d$');
+
   int get _need => kind == 'line' ? 2 : 3;
-  bool get canSave => armed && draft.length >= _need;
+
+  /// Why the behaviour settings cannot be saved, or null when they are fine.
+  /// Mirrors the server's validation so the operator finds out here rather
+  /// than from a rejected request.
+  String? get settingsError {
+    final t = loiterText.trim();
+    if (t.isNotEmpty) {
+      final v = double.tryParse(t);
+      if (v == null || v < 0 || v > 86400) {
+        return 'Loiter time must be 0–86400 seconds';
+      }
+    }
+    final from = armedFrom.trim(), to = armedTo.trim();
+    if (from.isEmpty != to.isEmpty) return 'Set both arming times, or neither';
+    for (final v in [from, to]) {
+      if (v.isNotEmpty && !_hhmm.hasMatch(v)) {
+        return 'Arming times must be 24-hour HH:MM';
+      }
+    }
+    return null;
+  }
+
+  bool get canSave => armed && draft.length >= _need && settingsError == null;
 
   int fenceCountForCam(int cam) => _fences.where((f) => f.camId == cam).length;
 
@@ -55,12 +91,24 @@ class FenceEditor extends ChangeNotifier {
   }
 
   // ── draw / edit lifecycle ────────────────────────────────────────────
+  void _resetSettings() {
+    label = '';
+    severity = 'Critical';
+    loiterText = '';
+    armedFrom = '';
+    armedTo = '';
+    inbound = '';
+  }
+
   void startDraw(int cam, String kind) {
     armed = true;
     editingId = null;
     draftCam = cam;
     this.kind = kind;
     draft.clear();
+    // Deliberately NOT resetting the settings: the form is filled in first and
+    // Draw pressed second, so what the operator already chose must survive it.
+    // Only cancel() and a completed save() clear it.
     notifyListeners();
   }
 
@@ -74,9 +122,20 @@ class FenceEditor extends ChangeNotifier {
     targets = f.targets.isNotEmpty ? f.targets.first : 'any';
     direction = f.direction;
     label = f.label;
+    severity = Fence.severities.contains(f.severity) ? f.severity : 'Critical';
+    // 30.0 shows as "30"; 0 shows as blank rather than a stray "0".
+    loiterText = f.loiterAfterS <= 0
+        ? ''
+        : (f.loiterAfterS == f.loiterAfterS.roundToDouble()
+            ? f.loiterAfterS.round().toString()
+            : f.loiterAfterS.toString());
+    armedFrom = f.armedFrom;
+    armedTo = f.armedTo;
+    inbound = f.inbound;
     draft
       ..clear()
       ..addAll(f.points);
+    revision++;
     notifyListeners();
   }
 
@@ -98,7 +157,8 @@ class FenceEditor extends ChangeNotifier {
     editingId = null;
     draftCam = null;
     draft.clear();
-    label = '';
+    _resetSettings();
+    revision++;
     notifyListeners();
   }
 
@@ -122,11 +182,49 @@ class FenceEditor extends ChangeNotifier {
     label = l;
   }
 
+  void setSeverity(String s) {
+    severity = s;
+    notifyListeners();
+  }
+
+  void setInbound(String i) {
+    inbound = i;
+    notifyListeners();
+  }
+
+  // Text settings notify so the inline validation message and the Save button
+  // track each keystroke; the form's controllers are not reset by this, only by
+  // a change of [revision].
+  void setLoiterText(String t) {
+    loiterText = t;
+    notifyListeners();
+  }
+
+  void setArmedFrom(String t) {
+    armedFrom = t;
+    notifyListeners();
+  }
+
+  void setArmedTo(String t) {
+    armedTo = t;
+    notifyListeners();
+  }
+
   // ── writes ────────────────────────────────────────────────────────────
   Future<String?> save() async {
-    if (!canSave || draftCam == null) return 'need $_need+ points';
-    final draftFence = Fence(
-      id: editingId,
+    if (!canSave || draftCam == null) {
+      return settingsError ?? 'need $_need+ points';
+    }
+    // Start from the fence being edited, not a blank one: copyWith carries its
+    // `extra` (server-owned created_at, and any field this client does not know
+    // yet) through the save. Building a fresh Fence here is what used to erase
+    // everything not on the form.
+    final existing = editingId == null
+        ? null
+        : _fences.where((x) => x.id == editingId).firstOrNull;
+    final draftFence = (existing ??
+            Fence(id: editingId, camId: draftCam!, kind: kind, points: const []))
+        .copyWith(
       camId: draftCam!,
       kind: kind,
       points: List.of(draft),
@@ -134,6 +232,11 @@ class FenceEditor extends ChangeNotifier {
       targets: [targets],
       label: label.trim(),
       enabled: true,
+      severity: severity,
+      loiterAfterS: double.tryParse(loiterText.trim()) ?? 0,
+      armedFrom: armedFrom.trim(),
+      armedTo: armedTo.trim(),
+      inbound: inbound,
     );
     final all = <Fence>[
       for (final f in _fences)

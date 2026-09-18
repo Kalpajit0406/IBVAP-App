@@ -1,3 +1,63 @@
+# ── Who and where this installation is ───────────────────────────────────────
+# Stamped on every event. Without it two Border Out Posts both emit event id 1
+# with a bare epoch timestamp and no location, and their logs cannot be merged
+# or correlated by whoever receives them. Set this before deploying anywhere.
+site:
+  site_id: "BOP-DEMO"           # short stable code, unique per installation
+  post_name: "Demo Post"        # what a human calls it
+  sector: ""                    # optional grouping above the post
+  lat: null                     # post coordinates, if known
+  lon: null
+
+# ── Sending alerts off this machine ──────────────────────────────────────────
+# Without a sink an alert reaches nobody unless a person is watching the
+# console — which is not an assumption an unmanned post can make. The queue
+# lives in data/events.db and survives power loss, so hours offline are normal
+# rather than an error: the forwarder drains it in order when the link returns.
+#
+# Try it on one laptop:   python scripts/alert_sink.py
+# then set url below to   http://localhost:9000/alert
+alerts:
+  enabled: true
+  poll_interval_s: 1.0
+  batch: 100
+  backoff_base_s: 2.0           # doubles per failure, with jitter
+  backoff_max_s: 300.0
+  max_attempts: 0               # 0 = retry forever; >0 drops a poisoned event
+  # How long a delivered event stays in the queue. This is the real number
+  # behind any "offline buffer" claim — at a remote post size it to the longest
+  # outage you expect to replay after.
+  retention_days: 7.0
+  max_queue_rows: 200000
+  sinks:
+    # JSON POST — what any modern C2, SIEM or incident tool already accepts.
+    - type: webhook
+      label: "C2 webhook"
+      enabled: false            # set true and point url at your endpoint
+      url: "http://localhost:9000/alert"
+      min_severity: "High"      # Info | Low | Medium | High | Critical
+      timeout_s: 5.0
+      verify_tls: true          # false only for a private/self-signed CA
+      headers: {}               # e.g. {Authorization: "Bearer ..."}
+    # RFC 5424 syslog carrying ArcSight CEF — plugs into an existing SOC with
+    # no code on their side.
+    - type: syslog
+      label: "SOC syslog"
+      enabled: false
+      host: ""
+      port: 514
+      protocol: udp             # udp | tcp
+      min_severity: "Critical"
+    # Optional; needs `pip install paho-mqtt`.
+    - type: mqtt
+      label: "Command centre MQTT"
+      enabled: false
+      host: ""
+      port: 1883
+      topic: "ibvap/events"
+      qos: 1
+      min_severity: "High"
+
 # ── Stream sources ───────────────────────────────────────────────────────────
 # server.py opens every entry here on startup, alongside phones:
 #   - url: rtsp://user:pass@ip:554/...   → a CCTV camera / NVR channel (pulled)
@@ -59,6 +119,36 @@ cctv:
 ingest:
   normalise_width: 1280
   normalise_height: 720
+  # Discard a frame whose capture timestamp is already older than this, before
+  # spending a JPEG decode on it. A phone on a congested link (a laptop Wi-Fi
+  # hotspot especially) can back up by many seconds; because TCP is strictly
+  # ordered, that backlog must still be received before a fresh frame is
+  # reachable, so skipping the decode is what lets the server catch up. Only
+  # applied while the phone's clock is trustworthy — see ws_capture.clock_ok.
+  # 0 disables age-dropping entirely.
+  max_frame_age_ms: 1200
+
+  # ── Adaptive uplink ────────────────────────────────────────────────────────
+  # The phone cannot see its own uplink (ws.bufferedAmount reads ~0 while frames
+  # sit in kernel and Wi-Fi driver queues), so the server — which measures the
+  # real capture→receive delay and can see every camera at once — picks each
+  # phone's resolution/fps/quality and pushes it down the same socket.
+  # Frame rate is always sacrificed before resolution: a recognition burst needs
+  # only a few good frames over several seconds, but face range depends directly
+  # on pixels, so halving fps costs almost nothing and halving width costs a lot.
+  adaptive: true
+  max_in_flight: 2          # unacked frames a phone may hold (bounds latency)
+  start_rung: 2             # cold start conservative; a good link earns its way up
+  demote_ms: 900            # over this for 2 evaluations -> drop a rung
+  panic_ms: 2500            # over this -> drop two rungs immediately
+  promote_ms: 450           # under this continuously -> earn a rung back
+  promote_dwell_s: 10.0     # ... for this long, and only one camera at a time
+  demote_dwell_s: 2.0       # back off fast, ramp slow (5:1)
+  # All phones share one bottleneck, so promotion is also capped globally —
+  # without this they demote together and promote together, and the link
+  # oscillates the way synchronised TCP flows do.
+  uplink_budget_mbps: 12.0
+  resend_s: 5.0             # re-assert current rung this often (messages are idempotent)
 
 # ── Model profiles (for live switching from the dashboard) ────────────────────
 # Each profile overrides model.weights and pose.weights when selected.
@@ -411,6 +501,32 @@ face:
                                  # available (Detector._native_for), same as ANPR/vehicle-type snapshots
   max_persons_per_pass: 8        # cap crops sent to the face model per camera per pass (mirrors pose.max_persons)
 
+  # ── Always keep a picture of every person, recognisable or not ─────────────
+  # Two separate bars. det_score_min (above) gates whether a reading may VOTE on
+  # identity; capture_score_min gates only whether the crop is worth SAVING. A
+  # face that is blurry, side-on, backlit or distant falls between them: it is
+  # snapshotted for the operator but can never name anyone, so always-capture
+  # adds no false-match risk. Below capture_score_min there is no face at all,
+  # and head_box_fallback keeps a geometric head crop from the person box.
+  always_capture: true
+  capture_score_min: 0.20        # save the crop at/above this detector confidence
+  head_box_fallback: true        # no face found at all -> crop the estimated head region
+  face_crop_pad_frac: 0.35       # pad the face box before saving — a tight box cuts chin/hairline
+  save_person_crop: true         # also save the whole person box, for context
+  # Best-of-burst picker. Sharpness is log-normalised because raw Laplacian
+  # variance spans ~5-2000 and would otherwise swamp every other term.
+  quality_weights: {det: 0.35, area: 0.30, sharp: 0.25, frontal: 0.10}
+
+  # A person track absent from this many seconds of detections keeps its burst
+  # state. One missed YOLO frame used to reset the burst to zero hits, which on
+  # a laggy stream meant burst_n was never reached. Kept inside ByteTrack's own
+  # lost_buffer_frames window, since the tracker re-associates under the same id.
+  prune_grace_s: 2.0
+  # attempt_window_s is enforced by a sweep this much later: wants_capture() and
+  # record()'s finish test are exact complements, so without a sweep a burst
+  # whose window lapses off the due-list never finalizes and never alerts.
+  sweep_grace_s: 1.0
+
 # One picture-burst + one JSON record per person arrival, under
 # data/face_results/<cam_id>/ — deliberately separate from data/snapshots/
 # (breach/weapon/posture) and from data/anpr_results/, same reasoning as ANPR:
@@ -419,7 +535,9 @@ face:
 face_results:
   enabled: true
   dir: "data/face_results"
-  jpeg_quality: 90
+  # Two small crops per arrival (best face, then person context) rather than one
+  # full frame per burst tick, so quality is cheap here — spend the bits.
+  jpeg_quality: 92
   # Every finalized arrival is filed (including "unknown") — only a confirmed
   # watchlist match is also hash-chained into evidence.
   log_to_evidence: true
@@ -453,6 +571,30 @@ geofence:
   reentry_cooldown_passes: 8     # a tripwire won't re-fire for the same track within this many passes
   exit_passes: 2                 # consecutive "outside" passes before a zone breach is considered over
                                 # (stops a target on the zone edge re-firing every pass)
+  # A target must be tracked this many passes before it can breach anything.
+  # One spurious detection landing inside a polygon used to raise Critical
+  # instantly; at detect_fps 8 this costs under half a second and removes the
+  # commonest false alarm there is. A system that cries wolf gets switched off.
+  min_track_passes: 3
+  min_box_height_frac: 0.0       # optionally also ignore targets smaller than this
+                                # fraction of frame height (0 = no size gate)
+  #
+  # Per-fence fields, set by the dashboard and stored in data/fences.json:
+  #   severity        "Info" | "Low" | "Medium" | "High" | "Critical" (default
+  #                   Critical) — a counting line across an approach road is not
+  #                   the same alarm as the perimeter wire, and giving them the
+  #                   same one is how an operator learns to ignore both.
+  #   loiter_after_s  raise a separate `loiter` alert once a target has been
+  #                   inside this long (0 = off). "He has been at the fence
+  #                   eleven minutes" is a thing a post acts on.
+  #   armed_from /    local-time window "HH:MM" this fence is live, e.g.
+  #   armed_to        18:00→06:00 for a gate that is legitimately busy by day.
+  #                   Equal or unset = always armed. Crosses midnight correctly.
+  #   inbound         "a2b" | "b2a" — which crossing direction counts as *into*
+  #                   our territory. There is no camera calibration and so no
+  #                   true geo-projection: this is whatever the person who drew
+  #                   the line says it is, and it is what makes the daily
+  #                   crossing tally mean something in a report.
 
 # ── Intrusion snapshots ────────────────────────────────────────────────────
 # On a virtual-fence breach, a confirmed weapon, or a malicious posture

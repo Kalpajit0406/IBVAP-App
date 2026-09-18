@@ -13,9 +13,11 @@ import 'package:ibvap_app/models/server_status.dart';
 import 'package:ibvap_app/models/threat.dart';
 import 'package:ibvap_app/screens/home_screen.dart';
 import 'package:ibvap_app/screens/monitor_screen.dart';
+import 'package:ibvap_app/screens/panels/fences_section.dart';
 import 'package:ibvap_app/services/tunnel_manager.dart';
 import 'package:ibvap_app/state/alert_log.dart';
 import 'package:ibvap_app/state/app_state.dart';
+import 'package:ibvap_app/state/fence_editor.dart';
 import 'package:ibvap_app/theme.dart';
 import 'package:ibvap_app/util/describe_error.dart';
 
@@ -33,6 +35,44 @@ Map<String, dynamic> _status({
       'meta': meta,
       'devices': [],
     };
+
+/// A fence as the server stores and returns it: the behaviour settings, the
+/// server-owned created_at, and a field this client has never heard of.
+Map<String, dynamic> _serverFence(String id, {int cam = 0}) => {
+      'id': id,
+      'cam_id': cam,
+      'kind': 'polygon',
+      'points': [[0.2, 0.2], [0.8, 0.2], [0.8, 0.8]],
+      'direction': 'both',
+      'targets': ['any'],
+      'label': 'wire $id',
+      'enabled': true,
+      'created_at': 1789000000.5,
+      'severity': 'Medium',
+      'loiter_after_s': 45.0,
+      'armed_from': '22:00',
+      'armed_to': '05:00',
+      'inbound': '',
+      'future_field': {'nested': [1, 2, 3]},
+    };
+
+/// A FenceEditor already loaded from a mock server, plus every body it POSTs.
+Future<(FenceEditor, List<Map<String, dynamic>>)> _fenceEditor(
+    List<Map<String, dynamic>> served) async {
+  final posted = <Map<String, dynamic>>[];
+  final mock = MockClient((req) async {
+    if (req.method == 'POST' && req.url.path == '/api/fences') {
+      posted.add(jsonDecode(req.body) as Map<String, dynamic>);
+      return http.Response('{"saved": 1}', 202,
+          headers: {'content-type': 'application/json'});
+    }
+    return http.Response(jsonEncode({'fences': served}), 200,
+        headers: {'content-type': 'application/json'});
+  });
+  final ed = FenceEditor(IbvapClient(client: mock));
+  await ed.load();
+  return (ed, posted);
+}
 
 void main() {
   group('shell', () {
@@ -394,6 +434,251 @@ void main() {
       expect(back.points.length, 2);
       expect(back.direction, 'a2b');
       expect(back.targets, ['person']);
+    });
+
+    test('Fence round-trips the behaviour settings', () {
+      final back = Fence.fromJson(Fence(
+        camId: 0,
+        kind: 'polygon',
+        points: [(0.1, 0.1), (0.9, 0.1), (0.5, 0.9)],
+        severity: 'Medium',
+        loiterAfterS: 45,
+        armedFrom: '22:00',
+        armedTo: '05:30',
+        inbound: 'b2a',
+      ).toJson());
+      expect(back.severity, 'Medium');
+      expect(back.loiterAfterS, 45);
+      expect(back.armedFrom, '22:00');
+      expect(back.armedTo, '05:30');
+      expect(back.inbound, 'b2a');
+    });
+
+    test('Fence keeps keys it does not manage (created_at, future fields)', () {
+      // The console saves by re-POSTing the whole list, so any key this class
+      // drops is erased from every fence on every save. created_at is
+      // server-owned and was being reset each time for exactly this reason.
+      final server = {
+        'id': 'f_1', 'cam_id': 0, 'kind': 'polygon',
+        'points': [[0.1, 0.1], [0.9, 0.1], [0.5, 0.9]],
+        'created_at': 1789000000.5,
+        'future_field': {'nested': [1, 2, 3]},
+      };
+      final out = Fence.fromJson(server).toJson();
+      expect(out['created_at'], 1789000000.5);
+      expect(out['future_field'], {'nested': [1, 2, 3]});
+    });
+
+    test('a managed key is never shadowed by a stale copy in extra', () {
+      final f = Fence.fromJson({
+        'cam_id': 0, 'kind': 'polygon',
+        'points': [[0.1, 0.1], [0.9, 0.1], [0.5, 0.9]],
+        'severity': 'Low',
+      }).copyWith(severity: 'High', extra: {'severity': 'Info', 'x': 1});
+      expect(f.toJson()['severity'], 'High');
+      expect(f.toJson()['x'], 1);
+    });
+
+    test('a fence from before these fields existed loads with defaults', () {
+      final f = Fence.fromJson({
+        'cam_id': 0, 'kind': 'polygon',
+        'points': [[0.1, 0.1], [0.9, 0.1], [0.5, 0.9]],
+      });
+      expect(f.severity, 'Critical');
+      expect(f.loiterAfterS, 0);
+      expect(f.armedFrom, '');
+      expect(f.inbound, '');
+      expect(f.extra, isEmpty);
+    });
+  });
+
+  group('FenceEditor', () {
+    // The regression this group exists for: saving from the console re-POSTs
+    // the whole fence list, and used to strip every behaviour setting (and the
+    // server's created_at) from all of it.
+    test('toggling one fence does not erase settings on any fence', () async {
+      final (ed, posted) = await _fenceEditor(
+          [_serverFence('f_a'), _serverFence('f_b', cam: 1)]);
+      expect(await ed.setEnabled('f_a', false), isNull);
+
+      final sent = (posted.single['fences'] as List).cast<Map<String, dynamic>>();
+      expect(sent.length, 2);
+      for (final f in sent) {
+        expect(f['severity'], 'Medium', reason: f['id']);
+        expect(f['loiter_after_s'], 45.0, reason: f['id']);
+        expect(f['armed_from'], '22:00', reason: f['id']);
+        expect(f['armed_to'], '05:00', reason: f['id']);
+        expect(f['created_at'], 1789000000.5, reason: f['id']);
+        expect(f['future_field'], {'nested': [1, 2, 3]}, reason: f['id']);
+      }
+      expect(sent.firstWhere((f) => f['id'] == 'f_a')['enabled'], false);
+      expect(sent.firstWhere((f) => f['id'] == 'f_b')['enabled'], true);
+    });
+
+    test('editing a fence saves the new settings and keeps the rest', () async {
+      final (ed, posted) = await _fenceEditor(
+          [_serverFence('f_a'), _serverFence('f_b', cam: 1)]);
+      ed.startEdit('f_a');
+      // The form is pre-filled from the stored fence, not blank.
+      expect(ed.severity, 'Medium');
+      expect(ed.loiterText, '45');
+      expect(ed.armedFrom, '22:00');
+      expect(ed.armedTo, '05:00');
+
+      ed
+        ..setLabel('north wire')
+        ..setSeverity('High')
+        ..setLoiterText('90')
+        ..setArmedFrom('20:00')
+        ..setArmedTo('06:30');
+      expect(await ed.save(), isNull);
+
+      final sent = (posted.single['fences'] as List).cast<Map<String, dynamic>>();
+      final a = sent.firstWhere((f) => f['id'] == 'f_a');
+      expect(a['label'], 'north wire');
+      expect(a['severity'], 'High');
+      expect(a['loiter_after_s'], 90.0);
+      expect(a['armed_from'], '20:00');
+      expect(a['armed_to'], '06:30');
+      // Rebuilding the fence from the form used to discard these.
+      expect(a['created_at'], 1789000000.5);
+      expect(a['future_field'], {'nested': [1, 2, 3]});
+      // and the fence that was not edited is untouched.
+      final b = sent.firstWhere((f) => f['id'] == 'f_b');
+      expect(b['severity'], 'Medium');
+      expect(b['loiter_after_s'], 45.0);
+    });
+
+    test('a new fence is created with the settings chosen before Draw', () async {
+      final (ed, posted) = await _fenceEditor([]);
+      ed
+        ..setSeverity('Low')
+        ..setLoiterText('20')
+        ..setArmedFrom('18:00')
+        ..setArmedTo('06:00')
+        ..setLabel('gate');
+      ed.startDraw(0, 'polygon');
+      // The form is filled in first and Draw pressed second; starting to draw
+      // must not throw away what the operator already chose.
+      expect(ed.severity, 'Low');
+      expect(ed.loiterText, '20');
+      expect(ed.label, 'gate');
+      ed.draft
+        ..add((0.1, 0.1))
+        ..add((0.9, 0.1))
+        ..add((0.5, 0.9));
+      expect(await ed.save(), isNull);
+
+      final f = (posted.single['fences'] as List).single as Map<String, dynamic>;
+      expect(f['severity'], 'Low');
+      expect(f['loiter_after_s'], 20.0);
+      expect(f['armed_from'], '18:00');
+      expect(f['armed_to'], '06:00');
+      expect(f['label'], 'gate');
+    });
+
+    test('cancel clears the settings, and only cancel/edit bump the revision',
+        () async {
+      final (ed, _) = await _fenceEditor([_serverFence('f_a')]);
+      ed
+        ..setSeverity('Low')
+        ..setLoiterText('20');
+      final r0 = ed.revision;
+      ed.startDraw(0, 'polygon');
+      expect(ed.revision, r0, reason: 'a keystroke-neutral action must not reset the form');
+      ed.cancel();
+      expect(ed.revision, r0 + 1);
+      expect(ed.severity, 'Critical');
+      expect(ed.loiterText, '');
+      ed.startEdit('f_a');
+      expect(ed.revision, r0 + 2);
+    });
+
+    test('invalid settings block saving and say why', () async {
+      final (ed, posted) = await _fenceEditor([]);
+      ed.startDraw(0, 'polygon');
+      ed.draft
+        ..add((0.1, 0.1))
+        ..add((0.9, 0.1))
+        ..add((0.5, 0.9));
+      expect(ed.canSave, isTrue);
+
+      // A lone time is treated as "always armed" by the server, so a fence the
+      // operator meant to be night-only would quietly stay live all day.
+      ed.setArmedFrom('22:00');
+      expect(ed.settingsError, contains('both'));
+      expect(ed.canSave, isFalse);
+      expect(await ed.save(), contains('both'));
+
+      ed.setArmedTo('25:00');
+      expect(ed.settingsError, contains('HH:MM'));
+      ed.setArmedTo('05:00');
+      expect(ed.settingsError, isNull);
+      expect(ed.canSave, isTrue);
+
+      ed.setLoiterText('abc');
+      expect(ed.settingsError, contains('Loiter'));
+      ed.setLoiterText('-5');
+      expect(ed.settingsError, contains('Loiter'));
+      ed.setLoiterText('');
+      expect(ed.settingsError, isNull);
+      expect(posted, isEmpty, reason: 'nothing may be sent while invalid');
+    });
+
+    testWidgets('the form shows the settings, follows an edit, and feeds the editor',
+        (tester) async {
+      tester.view.physicalSize = const Size(700, 1600);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+
+      final mock = MockClient((req) async {
+        final body = req.url.path == '/api/fences'
+            ? {'fences': [_serverFence('f_a')]}
+            : _status(ids: [0]);
+        return http.Response(jsonEncode(body), 200,
+            headers: {'content-type': 'application/json'});
+      });
+      final state = AppState(client: IbvapClient(client: mock));
+      addTearDown(state.dispose);
+      await tester.runAsync(state.refreshNow);
+      await tester.runAsync(state.fences.load);
+
+      await tester.pumpWidget(MaterialApp(
+        theme: buildIbvapTheme(),
+        home: Scaffold(
+            body: SingleChildScrollView(child: FencesSection(state: state))),
+      ));
+      await tester.pump();
+      expect(tester.takeException(), isNull);
+
+      // The stored fence's settings are visible in the list.
+      expect(find.textContaining('loiter 45s'), findsOneWidget);
+      expect(find.textContaining('armed 22:00–05:00'), findsOneWidget);
+
+      // Typing reaches the editor.
+      final loiter = find.widgetWithText(TextField, 'Loiter alert after (seconds)');
+      expect(loiter, findsOneWidget);
+      await tester.enterText(loiter, '30');
+      expect(state.fences.loiterText, '30');
+
+      // Starting an edit loads that fence into the fields and dropdown.
+      state.fences.startEdit('f_a');
+      await tester.pump();
+      expect(tester.widget<TextField>(loiter).controller!.text, '45');
+      expect(find.text('Medium alert'), findsOneWidget,
+          reason: 'the severity dropdown must follow the loaded fence');
+      expect(tester.widget<TextField>(
+              find.widgetWithText(TextField, 'Armed from')).controller!.text,
+          '22:00');
+
+      // A line shows the inbound choice instead of the loiter field.
+      state.fences.cancel();
+      state.fences.setKind('line');
+      await tester.pump();
+      expect(find.text('Inbound: not set'), findsOneWidget);
+      expect(find.widgetWithText(TextField, 'Loiter alert after (seconds)'),
+          findsNothing);
+      expect(tester.takeException(), isNull);
     });
   });
 

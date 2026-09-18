@@ -19,9 +19,14 @@ from ibvap.geofence import (GeoFenceEngine, ground_point,        # noqa: E402
 
 
 # ── builders ────────────────────────────────────────────────────────────────
-def _engine(fences, cooldown=8) -> GeoFenceEngine:
+def _engine(fences, cooldown=8, min_track_passes=1, **gf) -> GeoFenceEngine:
+    # min_track_passes is 1 here so the geometry cases stay one-pass and
+    # readable. The maturity gate that suppresses single-frame false positives
+    # is exercised by its own cases at the end of this file.
     eng = GeoFenceEngine({"geofence": {"enabled": True,
-                                       "reentry_cooldown_passes": cooldown}})
+                                       "reentry_cooldown_passes": cooldown,
+                                       "min_track_passes": min_track_passes,
+                                       **gf}})
     eng.set_fences(fences)
     return eng
 
@@ -219,8 +224,153 @@ def _():
     eng = _engine([BOX])
     assert len(eng.evaluate(_sr(0, [_det_at(1, 0.5, 0.5)]))) == 1
     eng.prune(0, set())                              # track 1 gone
-    assert eng._prev_ground == {} and eng._inside == set()
+    assert eng._prev_ground == {} and eng._inside == {}
     assert len(eng.evaluate(_sr(0, [_det_at(1, 0.5, 0.5)]))) == 1   # fires anew
+
+
+# ── border behaviours: dwell, counting, arming, maturity ────────────────────
+
+@case("a single-frame detection no longer raises a breach on its own")
+def _():
+    # One spurious person box whose ground point lands inside a polygon used to
+    # fire Critical immediately. That is the false alarm that gets a system
+    # switched off, so a track must persist before it counts.
+    eng = _engine([BOX], min_track_passes=3)
+    assert eng.evaluate(_sr(0, [_det_at(1, 0.5, 0.5)])) == []
+    assert eng.evaluate(_sr(0, [_det_at(1, 0.5, 0.5)])) == []
+    assert len(eng.evaluate(_sr(0, [_det_at(1, 0.5, 0.5)]))) == 1
+
+
+@case("loitering fires once after the dwell threshold, not every pass")
+def _():
+    import time as _t
+    fence = dict(BOX, loiter_after_s=0.05)
+    eng = _engine([fence])
+    b = eng.evaluate(_sr(0, [_det_at(1, 0.5, 0.5)]))
+    assert len(b) == 1 and b[0].event == "breach"
+    assert eng.evaluate(_sr(0, [_det_at(1, 0.5, 0.5)])) == []   # inside, too soon
+    _t.sleep(0.06)
+    out = eng.evaluate(_sr(0, [_det_at(1, 0.5, 0.5)]))
+    assert len(out) == 1 and out[0].event == "loiter"
+    assert out[0].elapsed_s >= 0.05
+    # and only once — a loiter alert that repeats every pass is a siren
+    assert eng.evaluate(_sr(0, [_det_at(1, 0.5, 0.5)])) == []
+
+
+@case("dwelling() reports who is inside a zone and for how long")
+def _():
+    eng = _engine([BOX])
+    eng.evaluate(_sr(0, [_det_at(1, 0.5, 0.5)]))
+    d = eng.dwelling()
+    assert len(d) == 1 and d[0]["track_id"] == 1 and d[0]["elapsed_s"] >= 0
+
+
+@case("crossings are counted per fence and per direction")
+def _():
+    eng = _engine([VLINE], cooldown=1)
+    # cross one way, then back
+    eng.evaluate(_sr(0, [_det_at(1, 0.2, 0.5)]))
+    eng.evaluate(_sr(0, [_det_at(1, 0.8, 0.5)]))
+    eng.evaluate(_sr(0, [_det_at(1, 0.2, 0.5)]))
+    counts = eng.crossing_counts()["by_camera"]["0"][VLINE["id"]]
+    assert sum(counts.values()) == 2, counts
+    assert len(counts) == 2, "the two directions should be tallied separately"
+
+
+@case("an operator-labelled fence counts crossings as inbound / outbound")
+def _():
+    # There is no camera calibration, so 'into the country' is whatever the
+    # person who drew the line said it was. The label is what makes the tally
+    # mean anything in a report.
+    eng = _engine([dict(VLINE, inbound="a2b")], cooldown=1)
+    eng.evaluate(_sr(0, [_det_at(1, 0.2, 0.5)]))
+    eng.evaluate(_sr(0, [_det_at(1, 0.8, 0.5)]))
+    eng.evaluate(_sr(0, [_det_at(1, 0.2, 0.5)]))
+    counts = eng.crossing_counts()["by_camera"]["0"][VLINE["id"]]
+    assert set(counts) == {"inbound", "outbound"}, counts
+
+
+@case("a fence outside its arming window stays quiet")
+def _():
+    from ibvap.geofence import Fence
+    f = Fence(id="x", cam_id=0, kind="polygon", points=[(0, 0)],
+              armed_from="22:00", armed_to="05:00")
+    import time as _t
+    midnight = _t.mktime(_t.struct_time((2026, 1, 1, 0, 30, 0, 0, 1, -1)))
+    noon = _t.mktime(_t.struct_time((2026, 1, 1, 12, 0, 0, 0, 1, -1)))
+    assert f.armed_at(midnight) is True, "should be armed inside a window that crosses midnight"
+    assert f.armed_at(noon) is False, "should be disarmed by day"
+    # An unset window means always armed — the existing default must not change.
+    assert Fence(id="y", cam_id=0, kind="polygon", points=[]).armed_at(noon) is True
+
+
+@case("per-fence severity survives a round trip through the store format")
+def _():
+    from ibvap.geofence import _parse_fence
+    f = _parse_fence(dict(BOX, severity="Medium", loiter_after_s=30.0,
+                          armed_from="18:00", armed_to="06:00", inbound="b2a"))
+    assert f.severity == "Medium" and f.loiter_after_s == 30.0
+    assert f.armed_from == "18:00" and f.inbound == "b2a"
+    assert f.to_public()["severity"] == "Medium"
+    # Fences written before these fields existed must still load.
+    old = _parse_fence(BOX)
+    assert old.severity == "Critical" and old.loiter_after_s == 0.0
+
+
+def _errs(**over) -> list[str]:
+    return GeoFenceEngine.validate([dict(BOX, **over)])
+
+
+@case("validate accepts the behaviour fields when they are well formed")
+def _():
+    assert _errs(severity="Medium", loiter_after_s=30, armed_from="22:00",
+                 armed_to="05:30", inbound="a2b") == []
+    # A fence that predates these fields, and a client that sends them empty or
+    # null, must both still be accepted — they mean "unset", not "invalid".
+    assert _errs() == []
+    assert _errs(severity=None, loiter_after_s=None, armed_from=None,
+                 armed_to=None, inbound=None) == []
+    assert _errs(armed_from="", armed_to="", inbound="") == []
+
+
+@case("validate rejects an unknown severity, which would otherwise be stored as-is")
+def _():
+    assert any("severity" in e for e in _errs(severity="banana"))
+    assert any("severity" in e for e in _errs(severity="critical"))   # case matters
+
+
+@case("validate rejects a loiter time that is negative, huge, or not a number")
+def _():
+    for bad in (-1, 10 ** 7, "30", "abc", True, [30]):
+        assert any("loiter_after_s" in e for e in _errs(loiter_after_s=bad)), bad
+    assert _errs(loiter_after_s=0) == []
+
+
+@case("validate rejects malformed or half-set arming times")
+def _():
+    for bad in ("25:00", "7:30", "12:60", "noon", "1800"):
+        assert any("armed_from" in e for e in _errs(armed_from=bad, armed_to="06:00")), bad
+    # A lone time is treated as "always armed" by armed_at(), so a fence meant
+    # to be night-only would silently stay live all day. Refuse it outright.
+    assert any("together" in e for e in _errs(armed_from="22:00"))
+    assert any("together" in e for e in _errs(armed_to="06:00"))
+
+
+@case("validate rejects an unknown inbound direction")
+def _():
+    assert any("inbound" in e for e in _errs(inbound="left"))
+    assert any("inbound" in e for e in _errs(inbound="both"))
+
+
+@case("a fence with JSON nulls loads with defaults instead of being dropped")
+def _():
+    from ibvap.geofence import _parse_fence
+    f = _parse_fence(dict(BOX, severity=None, loiter_after_s=None,
+                          armed_from=None, armed_to=None, inbound=None))
+    assert f.severity == "Critical" and f.loiter_after_s == 0.0
+    assert f.armed_from == "" and f.inbound == ""
+    eng = _engine([dict(BOX, severity=None, loiter_after_s=None)])
+    assert eng.count == 1, "a null field silently discarded the whole fence"
 
 
 @case("validate rejects malformed fences")
