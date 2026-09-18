@@ -324,17 +324,17 @@ CCTV (RTSP/ONVIF) → Camera Tamper/Health Monitor + Edge Store-and-Forward
     → Video Ingestion & Frame Sampling (Day/Night/Thermal)
     → AI Analysis (YOLO26n + ByteTrack)
     → [Person | Vehicle (ANPR) | Threat Behaviour (posture) | Virtual Fence (ibvap/geofence.py — LIVE)]
-    → Event & Risk Engine (zone × time × behaviour → 0–100 score; a fence breach forces Critical)
+    → Event & Risk Engine (zone × time × behaviour → 0–100 score; a breach of a Critical-severity fence — the default — forces Critical)
     → Command Dashboard (vanilla HTML: MJPEG mosaic + fence draw tool + /status poll)
 ```
 
-Face-match and a map view are roadmap; the fence engine and the dashboard are live.
+Face-match (a small enrolled watchlist — `docs/FACE_RECOGNITION.md`), the fence engine and the dashboard are live; a map view is roadmap.
 
 **Track B — Verification & Evidence**
 ```
 Human Verify → Confirm → Intercept Dispatch
     → Event + Face Evidence (DB)
-    → SHA-256 Hash + Blockchain Ledger
+    → SHA-256 hash-chained ledger  (anchoring the chain on a blockchain: roadmap)
     → Secure Audit Log
 ```
 
@@ -710,6 +710,12 @@ static camera stays "idle".
 pipeline sustains ~467, leaving headroom for roughly 19 streams. At 12 streams
 it holds 526 fps against the 288 fps needed.
 
+**Read those as GPU-side headroom only.** The sources were phones and
+pre-loaded video, so H.264 decode is not in the number. Real RTSP is decoded on
+the CPU (no NVDEC), and `docs/CCTV_INTEGRATION.md` already notes 8–10 cameras
+pegging it. **No real-camera count has been measured** — do not present "19
+streams" as 19 CCTV cameras.
+
 Benchmark numbers are only meaningful after a warm-up run — cuDNN autotuning
 made the first configuration measured look 4× slower than it was, which briefly
 made motion gating appear to be a regression. `scripts/benchmark.py` now discards a
@@ -724,13 +730,13 @@ warm-up pass; keep it that way.
 | Detection | **YOLO26n** (Ultralytics ≥8.3.0) | 40.9 mAP, 1.7 ms T4 TRT, 2.4M params |
 | Tracker | **ByteTrack** | 80.3 MOTA; faster than DeepSORT, default in Ultralytics pipeline |
 | ANPR | YOLOv8 plate detector + EasyOCR (`ibvap/anpr.py`) | Live. On vehicle crops only; threaded OCR. `docs/ANPR.md` |
-| Face detection | RetinaFace | Detection only — no live matching in demo |
+| Face recognition | RetinaFace + ArcFace (InsightFace `buffalo_l`) | Live against a small enrolled watchlist (team photos), burst-voted. `docs/FACE_RECOGNITION.md`. Non-commercial-research weights |
 | Re-ID | OSNet | Architecture/roadmap target; demo uses timestamp + visual heuristic |
-| Backend | FastAPI + WebSocket + PostgreSQL/PostGIS | |
-| Frontend | React 18 + Tailwind CSS + Leaflet | |
-| Blockchain | SHA-256 hash-chain ledger | Evidence integrity, not a distributed network |
-| Edge buffer | SQLite store-and-forward queue | 72-hour offline alert buffer |
-| Deployment | Docker + NVIDIA Jetson Orin Nano/NX | |
+| Backend | FastAPI + WebSocket + SQLite (WAL) | PostgreSQL/PostGIS is roadmap — not used |
+| Frontend | Flutter Windows console + vanilla-HTML dashboard (`static/monitor.html`) | React/Tailwind/Leaflet is roadmap — not used |
+| Blockchain | SHA-256 hash-chain ledger | Tamper-evident local log, not a distributed network. Anchoring the chain tip on a blockchain is roadmap |
+| Edge buffer | SQLite store-and-forward queue | Drained by `ibvap/alert_forward.py` to webhook / syslog-CEF / MQTT sinks. Delivered events kept `alerts.retention_days` (default 7); undelivered events are kept until delivered |
+| Deployment | Windows + NVIDIA CUDA workstation (Flutter console, bundled Python) | Docker and Jetson Orin are roadmap — no Dockerfile or aarch64 build exists, and an NVIDIA GPU is required |
 
 **Python:** 3.11.9 (NOT 3.13/3.14 — PyTorch unsupported)
 **CUDA:** 12.6 · **Inference precision:** FP16 for deployment, FP32 for dev
@@ -777,11 +783,11 @@ hardware-specific): `python tools/export_engine.py` — reads `image_size` and
 
 - **AI inference stream:** 720p (1280×720) @ 15–25 fps via RTSP/ONVIF substream — never the primary 4K recording stream
 - **Effective inference rate:** 8–10 fps (`detect_fps: 8`), with ByteTrack carrying boxes at the full 24 fps
-- **Measured capacity:** 4 × 720p/24fps at ~467 fps aggregate on an RTX 3050 6 GB; ~19 streams of headroom
-- **Risk score:** 0–100; zone sensitivity 40% + time-of-day 20% + behaviour 40%; threshold **≥70** = Critical Alert
+- **Measured capacity:** 4 × 720p/24fps at ~467 fps aggregate on an RTX 3050 6 GB — **GPU-side only** (phone / pre-loaded sources, decode excluded; ~19 streams of GPU headroom). No real-RTSP camera count has been measured; expect CPU decode to bind first
+- **Risk score:** 0–100; zone sensitivity 40% + time-of-day 20% + behaviour 40%; threshold **≥50** = High. A score alone never reaches Critical (`risk.score_can_reach_critical: false`) — Critical is reserved for a confirmed weapon, a watchlist match, or a breach of a Critical-severity fence (the default)
 - **YOLO26n COCO mAP:** 40.9 (50–95); latency 1.7 ms T4 TRT / 38.9 ms CPU ONNX
-- **Evidence retention:** 90 days local, then archived to central command
-- **False-positive target:** <15% at launch, tuned via active learning
+- **Evidence retention:** target 90 days local, then archived to central command — **not implemented**: snapshot, ANPR, face and evidence folders grow without limit (only the alert queue in `events.db` is pruned)
+- **False-positive target:** <15% at launch — **a target, not a measurement**: no false-alarm rate has been measured for any detector yet
 - **License:** AGPL-3.0 (all Ultralytics models) — acknowledge openly, do not hide
 
 ---

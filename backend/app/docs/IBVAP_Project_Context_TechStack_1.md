@@ -25,6 +25,24 @@ My original recommendation was YOLOv8n specifically because it has far more tuto
 
 ## 3. Final Tech Stack (pending the decision above)
 
+> **Status: this section and §4 are the DESIGN TARGET, not a description of the
+> current build.** Where the build differs (checked against the code):
+>
+> | Design says | The build actually has |
+> |---|---|
+> | YOLOv8n / YOLOv10 + DeepSORT | **YOLO26n + ByteTrack** (TensorRT FP16) |
+> | ANPR: EasyOCR / PaddleOCR | YOLO plate detector + **fast-plate-ocr** (`anpr.ocr_backend: fast_plate`) |
+> | Face: detection only, no live matching | **Live watchlist recognition** (RetinaFace + ArcFace) against a small enrolled gallery — `docs/FACE_RECOGNITION.md` |
+> | Multi-camera Re-ID, GIS layer (Leaflet + PostGIS) | **Roadmap — neither exists** |
+> | Risk: ~70 triggers "Critical Alert" | **High ≥50.** A score alone never reaches Critical; Critical = confirmed weapon, watchlist match, or a Critical-severity fence breach |
+> | Backend on PostgreSQL/PostGIS; React + Tailwind dashboard | **FastAPI + SQLite (WAL)**; a **Flutter** Windows console plus a vanilla-HTML dashboard. No PostgreSQL, PostGIS or React |
+> | "Blockchain evidence" | A local **SHA-256 hash chain** (tamper-evident). **Nothing is anchored on any blockchain** — roadmap |
+> | Camera Tamper/Health Monitor | **Does not exist** |
+> | Edge store-and-forward, syncs on reconnect | **Implemented**: `ibvap/alert_forward.py` drains it to webhook / syslog-CEF / MQTT sinks, in order, with backoff |
+> | Day/Night + Thermal modes | A thermal-trained model profile exists, but the day/night switch is a **manual** button, not automatic |
+> | Jetson Orin + Docker | **Roadmap.** Today: a Windows + NVIDIA CUDA workstation; no Dockerfile, no aarch64 build |
+> | "Intercept Dispatch", PTZ auto-aim (§4) | **Not built.** Alerts leave via the configured sinks; there is no dispatch workflow or PTZ control |
+
 | Layer | Tools | Notes |
 |---|---|---|
 | **Video Ingestion** | OpenCV + FFmpeg (RTSP/ONVIF) | Pull the camera's **secondary/AI substream** (720p, 15–25fps) — never the primary 4K/1080p recording stream, for cost/compute reasons (see §5) |

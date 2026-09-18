@@ -96,7 +96,7 @@ Everything below is what to *state* as your system requirements — pulled from 
 | **Boot storage** | 2× 960GB NVMe, RAID-1 | [TUNABLE] |
 | **Evidence/hash-chain buffer** | 4TB NVMe per GPU-equivalent, scale with node size | [TUNABLE] |
 | **Evidence retention policy** | Not yet defined — **needs a number before submission** | [MISSING — see below] |
-| **Offline store-and-forward buffer** | Local SQLite queue; size = (alert rate × avg event size × expected outage duration) | [TUNABLE] — pick a concrete number, e.g. "72 hours of buffered alerts" |
+| **Offline store-and-forward buffer** | Local SQLite queue (`events.db`), drained by `ibvap/alert_forward.py`; size = (alert rate × avg event size × expected outage duration) | **Implemented.** Delivered events are kept `alerts.retention_days` (default 7); undelivered events are never pruned, so the buffer is bounded by disk, not by a time limit. Size disk for your longest expected outage |
 
 **Gap to close:** you don't currently have a stated evidence retention period (30 days? 90 days? matches BSA 2023 requirements?). Pick one — "90 days local, then archived to central command" is a reasonable, defensible default.
 
@@ -111,13 +111,16 @@ Ultralytics      ≥8.3.0
 OpenCV           (bundled with Ultralytics — do not pin separately)
 FastAPI          ≥0.115.0
 Uvicorn          ≥0.30.0
-PostgreSQL       15+ with PostGIS extension
+SQLite           (stdlib, WAL) — the event store actually in use
 EasyOCR          ≥1.7.2
 InsightFace      ≥0.7.3
 onnxruntime-gpu  ≥1.19.0
-React            18.x
-Docker           24.x+ (containerized deployment)
+Flutter          (Dart SDK ≥3.12) — the Windows operator console actually in use
 ```
+
+Roadmap only — **not used by the current build**, so do not list them as
+reproducibility versions: PostgreSQL 15+ with PostGIS, React 18.x, Docker 24.x+
+(containerised deployment).
 
 ---
 
@@ -128,9 +131,9 @@ You've named this feature repeatedly but never fixed numbers. For the demo/PPT, 
 | Parameter | Suggested value | Status |
 |---|---|---|
 | Risk score scale | 0–100 | [TUNABLE — already used in your diagram] |
-| Critical alert threshold | ≥70 | [TUNABLE — already used in your diagram] |
+| High alert threshold | ≥50 (`risk.threshold_high`) | Implemented. A score alone never reaches Critical (`risk.score_can_reach_critical: false`); Critical is reserved for a confirmed weapon, a watchlist match, or a breach of a Critical-severity fence |
 | Score inputs | Zone sensitivity (weight 40%) + time-of-day (weight 20%) + behavior pattern (weight 40%) | [TUNABLE — pick weights, defend the logic] |
-| Target false-positive rate | State a number, e.g. "<15% at launch, tuned down via active learning" | [MISSING — pick one] |
+| Target false-positive rate | State a number, e.g. "<15% at launch, tuned down via active learning" | [MISSING — pick one]. Present it as a target: **no false-alarm rate has been measured for any detector yet** |
 
 A judge asking "how is the risk score calculated" and getting "it's a weighted engine" with no numbers is a weak answer. Getting specific weights — even if simple and provisional — is a strong one.
 
@@ -141,7 +144,10 @@ A judge asking "how is the risk score calculated" and getting "it's a weighted e
 These are architecture/roadmap items — don't present them as live capabilities in the demo:
 
 - Multi-camera Re-ID (OSNet) — demo uses simplified heuristic
-- Criminal DB face matching — architected to call NCRB CrPI via API, no live matching in demo
+- Criminal DB face matching — architected to call NCRB CrPI via API, no live matching against a real database in demo. (A small enrolled watchlist of team photos **is** live: `docs/FACE_RECOGNITION.md`)
+- Blockchain anchoring — the evidence log is a local SHA-256 hash chain (tamper-evident); nothing is anchored on any chain yet
+- Docker / Jetson Orin deployment — no Dockerfile or aarch64 build exists; the current build is a Windows + NVIDIA CUDA workstation
+- Real-CCTV scale — GPU headroom was measured on phone / pre-loaded sources; no real-RTSP camera count has been measured
 - VLM-based explainable alerts — mentioned as future enhancement only if you haven't built it
 - Feed-spoofing/replay-attack detection — mention as designed, not demonstrated, unless built
 
@@ -155,16 +161,16 @@ These are architecture/roadmap items — don't present them as live capabilities
 | Tracker | ByteTrack, 80.3 MOTA |
 | Dev GPU | RTX 3050, 6GB VRAM |
 | Production GPU | RTX 4000 SFF Ada, 20GB, 70W |
-| Cameras/GPU | ~50 (engineering estimate) |
+| Cameras/GPU | ~50 (engineering estimate — unmeasured; on real RTSP, CPU decode binds first — `docs/CCTV_INTEGRATION.md` reports 8–10 cameras pegging the CPU) |
 | AI input stream | 720p substream, 15–25fps, RTSP/ONVIF |
 | Effective inference rate | 8–10fps with frame-skip |
 | Detection range (full analytics) | 0–80m |
 | Detection range (detection-only) | 80–300m |
 | Detection range (thermal presence) | 1.5–8km |
-| Risk threshold | 70/100 |
-| Evidence integrity | SHA-256 hash-chain |
+| Risk threshold | High ≥50/100; Critical only via weapon / watchlist / fence-breach override |
+| Evidence integrity | SHA-256 hash-chain (tamper-evident; not anchored on a blockchain) |
 | Software license | AGPL-3.0 (acknowledged) |
-| Deployment | Docker, hardware-agnostic |
+| Deployment | Windows + NVIDIA CUDA workstation today; Docker / Jetson are roadmap |
 
 ---
 

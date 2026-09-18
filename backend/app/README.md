@@ -12,7 +12,8 @@ SHA-256 hash-chained evidence log.
 
 - **Batched multi-stream inference** — every camera's frame goes through the
   model in one forward pass (the nvstreammux idea). Measured 8×720p@24fps at
-  ~192 fps aggregate on an RTX 3050 6 GB, GPU ~35 %.
+  ~192 fps aggregate on an RTX 3050 6 GB, GPU ~35 % — from phone / pre-loaded
+  sources, so it excludes H.264 decode; real-RTSP camera counts are unmeasured.
 - **Two-thread pipeline** — a fixed-tick muxer feeds a separate inference
   worker, so a slow GPU pass never backpressures the camera sockets.
 - **Motion gating** — a cheap frame-difference pre-filter; a static scene never

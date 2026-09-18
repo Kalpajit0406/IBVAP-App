@@ -673,8 +673,9 @@ evidence:
 
 # ── Network exposure (ibvap/security.py) ──────────────────────────────────────
 # IBVAP is one local product: the app, API, dashboard and video streams are
-# only reachable from this machine. Outbound traffic (CCTV pulls, alert
-# delivery, blockchain anchoring) is unaffected.
+# only reachable from this machine. Outbound traffic (CCTV pulls, and alert
+# delivery via `alerts.sinks`) is unaffected. Anchoring the evidence chain on a
+# blockchain would be outbound too, but it is roadmap — nothing does it today.
 # CURRENT SETTINGS ARE FOR TESTING WITH PHONES. To lock the product down to
 # this machine once phones are removed, set:
 #   network.bind_host: "127.0.0.1"
