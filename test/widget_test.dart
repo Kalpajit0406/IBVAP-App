@@ -14,6 +14,8 @@ import 'package:ibvap_app/models/threat.dart';
 import 'package:ibvap_app/screens/home_screen.dart';
 import 'package:ibvap_app/screens/monitor_screen.dart';
 import 'package:ibvap_app/screens/panels/fences_section.dart';
+import 'package:ibvap_app/screens/panels/streams_panel.dart';
+import 'package:ibvap_app/widgets/add_camera_dialog.dart';
 import 'package:ibvap_app/services/tunnel_manager.dart';
 import 'package:ibvap_app/state/alert_log.dart';
 import 'package:ibvap_app/state/app_state.dart';
@@ -747,6 +749,152 @@ void main() {
       expect(ok, isFalse);
       expect(t.status, TunnelStatus.failed);
       expect(t.error, contains('winget install'));
+    });
+  });
+
+  group('YouTube camera source', () {
+    /// A stream row as `GET /api/streams` returns it for a YouTube camera.
+    Map<String, dynamic> ytRow({
+      String title = 'Bridge Cam',
+      bool live = true,
+      String error = '',
+    }) =>
+        {
+          'id': 2,
+          'name': 'CAM-02',
+          'url': 'https://www.youtube.com/watch?v=CXYr04BWvmc',
+          'raw_url': 'https://www.youtube.com/watch?v=CXYr04BWvmc',
+          'type': 'youtube',
+          'enabled': true,
+          'zone_sensitivity': 0.7,
+          'transport': 'tcp',
+          'decode_fps': 15,
+          'live': true,
+          'frames_received': 412,
+          'phone_url': null,
+          'title': title,
+          'is_live': live,
+          'quality': '720p',
+          'last_error': error,
+        };
+
+    Future<AppState> pumpCameras(
+        WidgetTester tester, Map<String, dynamic> row) async {
+      tester.view.physicalSize = const Size(1280, 900);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+
+      final mock = MockClient((req) async {
+        if (req.url.path == '/api/streams') {
+          return http.Response(
+              jsonEncode({'lan_ip': '10.0.0.2', 'streams': [row]}), 200,
+              headers: {'content-type': 'application/json'});
+        }
+        return http.Response(jsonEncode(_status()), 200,
+            headers: {'content-type': 'application/json'});
+      });
+      final state = AppState(client: IbvapClient(client: mock));
+      addTearDown(state.dispose);
+      await tester.pumpWidget(MaterialApp(
+        theme: buildIbvapTheme(),
+        home: Scaffold(body: StreamsPanel(state: state)),
+      ));
+      await tester.pumpAndSettle();
+      return state;
+    }
+
+    testWidgets('the card names the video playing, not just the link',
+        (tester) async {
+      // A YouTube URL is an opaque id; without the title an operator cannot
+      // tell which of two cameras is which.
+      await pumpCameras(tester, ytRow());
+      expect(find.textContaining('Bridge Cam'), findsOneWidget);
+      expect(find.textContaining('720p'), findsOneWidget);
+      expect(find.textContaining('LIVE'), findsWidgets);
+      expect(find.text('YOUTUBE'), findsOneWidget);
+      // RTSP transport is meaningless here and must not be implied.
+      expect(find.textContaining('Transport:'), findsNothing);
+      await tester.pumpWidget(const SizedBox());
+    });
+
+    testWidgets('a link that could not be resolved says so on the card',
+        (tester) async {
+      await pumpCameras(tester,
+          ytRow(title: '', error: 'Video unavailable'));
+      expect(find.textContaining('Video unavailable'), findsOneWidget);
+      await tester.pumpWidget(const SizedBox());
+    });
+
+    testWidgets('the add form posts a YouTube link unchanged, with no new field',
+        (tester) async {
+      // The link travels in the existing `url`; POST /api/streams rebuilds the
+      // entry from a fixed key set server-side, so anything else would vanish.
+      tester.view.physicalSize = const Size(1280, 1400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+
+      final posted = <Map<String, dynamic>>[];
+      final mock = MockClient((req) async {
+        if (req.method == 'POST' && req.url.path == '/api/streams') {
+          posted.add(jsonDecode(req.body) as Map<String, dynamic>);
+          return http.Response('{"saved": {}}', 202,
+              headers: {'content-type': 'application/json'});
+        }
+        return http.Response(jsonEncode(_status()), 200,
+            headers: {'content-type': 'application/json'});
+      });
+      final state = AppState(client: IbvapClient(client: mock));
+      addTearDown(state.dispose);
+
+      await tester.pumpWidget(MaterialApp(
+        theme: buildIbvapTheme(),
+        home: Scaffold(
+          body: Builder(
+            builder: (ctx) => TextButton(
+              onPressed: () => AddCameraDialog.show(ctx, state),
+              child: const Text('open'),
+            ),
+          ),
+        ),
+      ));
+      await tester.tap(find.text('open'));
+      await tester.pumpAndSettle();
+
+      const url = 'https://www.youtube.com/watch?v=aqz-KE-bpKQ';
+      await tester.enterText(find.byType(TextField).at(1), url);
+      await tester.pumpAndSettle();
+
+      // The RTSP transport control gives way once the URL is a YouTube link.
+      expect(find.text('Transport Protocol'), findsNothing,
+          reason: 'a dead control must not be offered');
+      expect(find.text('YouTube Source'), findsOneWidget);
+
+      await tester.tap(find.widgetWithText(FilledButton, 'Save & Load Camera'));
+      await tester.runAsync(() => Future.delayed(const Duration(milliseconds: 50)));
+      await tester.pump();
+
+      expect(posted, hasLength(1));
+      expect(posted.single['url'], url, reason: 'the link must arrive intact');
+      expect(posted.single.keys, isNot(contains('youtube')),
+          reason: 'no new field: the server would drop it');
+      await tester.pumpWidget(const SizedBox());
+    });
+
+    test('probing outlives the client-wide timeout', () async {
+      // The server spends up to 6 s on a dead RTSP host and up to 25 s asking
+      // YouTube about a link. With the shared 5 s timeout, Test reported every
+      // YouTube link — and every slow camera — as broken.
+      final mock = MockClient((req) async {
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+        return http.Response('{"ok": true, "note": "A Clip"}', 200,
+            headers: {'content-type': 'application/json'});
+      });
+      final client =
+          IbvapClient(client: mock, timeout: const Duration(milliseconds: 60));
+      await expectLater(client.streams(), throwsA(isA<IbvapApiException>()),
+          reason: 'an ordinary call still uses the short timeout');
+      final res = await client.probeStream('https://youtu.be/x');
+      expect(res['ok'], isTrue);
     });
   });
 }

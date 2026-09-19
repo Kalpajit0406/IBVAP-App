@@ -16,8 +16,14 @@ Design notes for real cameras (see docs/CCTV_INTEGRATION.md):
   * `grab()` every loop (cheap — drains the socket, no buffer bloat), but
     `retrieve()` (the expensive decode) only at `decode_fps`. Detection runs at
     8 fps and CCTV sub-streams are often 12–15 fps anyway.
+  * A **recording** (a local clip, a YouTube video) is paced to a wall clock —
+    see `_Pacer`. A live source paces itself on the network; a recording does
+    not, and would otherwise be replayed at whatever speed the CPU can demux.
   * Auto-reconnect with backoff; a stall watchdog reopens a stream that stops
     delivering frames without erroring.
+  * `_resolve_source()` is the seam for a source whose real URL is not the one
+    the operator typed and has to be looked up again on every reopen (see
+    `youtube_capture.YouTubeCapture`).
   * Every frame normalised to (norm_w, norm_h) so the detector sees one size.
   * Credentials in the URL are redacted everywhere they are logged or exposed.
 """
@@ -57,6 +63,57 @@ def redact(url: str) -> str:
     return _CRED_RE.sub(lambda m: f"://{m.group(1)}:***@", str(url))
 
 
+class _Pacer:
+    """Hold a recorded source to its own frame rate.
+
+    A live camera paces itself: `grab()` blocks until the next packet arrives
+    off the socket. A *recording* does not — demuxing a local file or a
+    googlevideo URL returns as fast as the CPU allows (measured: ~470 fps on a
+    720p clip), so without this the clip races past on the dashboard and, worse,
+    the behaviour engine — which measures speed in body-heights per second of
+    **wall clock** — reads every walk as a sprint.
+
+    `wait()` is called once per frame before `grab()` and sleeps until that
+    frame is due. Falling behind is normal (a slow decode, a laptop waking from
+    sleep); catching up by racing is not, because it fast-forwards the picture.
+    Past `RESYNC_AFTER` seconds of lateness the backlog is dropped instead.
+
+    `clock` and `sleep` are injectable so the pacing can be tested without
+    spending real time — see tests/test_youtube_capture.py.
+    """
+
+    RESYNC_AFTER = 1.0
+    MAX_FPS = 120.0           # a bogus CAP_PROP_FPS must not stall the thread
+
+    def __init__(self, fps: float, *, clock=time.monotonic, sleep=time.sleep) -> None:
+        fps = float(fps or 0.0)
+        if not (0.0 < fps <= self.MAX_FPS):
+            fps = 25.0        # unreadable/absurd header — assume ordinary video
+        self.fps = fps
+        self.period = 1.0 / fps
+        self._clock, self._sleep = clock, sleep
+        self._t0 = 0.0
+        self.frames = 0
+        self.resyncs = 0
+
+    def reset(self) -> None:
+        self._t0 = self._clock()
+        self.frames = 0
+
+    def wait(self) -> None:
+        if not self._t0:
+            self.reset()
+        due = self._t0 + self.frames * self.period
+        self.frames += 1
+        late = self._clock() - due
+        if late < 0:
+            self._sleep(-late)
+        elif late > self.RESYNC_AFTER:
+            self._t0 = self._clock()
+            self.frames = 1
+            self.resyncs += 1
+
+
 class RtspCapture:
     STALE_AFTER = 3.0     # matches WebSocketCapture so the muxer's cutoff is uniform
 
@@ -74,6 +131,16 @@ class RtspCapture:
         self._source: int | str = int(url) if str(url).isdigit() else str(url)
         self._is_file = isinstance(self._source, str) and bool(
             re.search(r"\.(mp4|avi|mov|mkv|webm)$", self._source, re.I))
+
+        # `paced`: hold this source to its own frame rate (see _Pacer). True for
+        # anything delivered faster than it plays — a clip on disk, a YouTube
+        # video, an HLS live stream that arrives a segment at a time. False for
+        # RTSP and webcams, where the socket paces itself packet by packet.
+        # `loop_at_end`: rewind and play again instead of reconnecting.
+        # A subclass that only learns which it has once the URL is resolved
+        # sets both from `_resolve_source()`.
+        self.paced = self._is_file
+        self.loop_at_end = self._is_file
 
         self.label = (name or f"CAM-{cam_id:02d}")[:40]
         self.kind = "rtsp" if str(self._source).lower().startswith("rtsp") else \
@@ -144,14 +211,28 @@ class RtspCapture:
                            "frame pushed to the same id", self.cam_id)
 
     # ── the decode thread ──────────────────────────────────────────────────
+    def _resolve_source(self) -> int | str:
+        """What to hand cv2.VideoCapture — called fresh on every (re)open.
+
+        Here, the URL the operator typed. A subclass whose real media URL has
+        to be looked up, and expires, overrides this."""
+        return self._source
+
     def _open_capture(self) -> cv2.VideoCapture | None:
-        api = cv2.CAP_FFMPEG if isinstance(self._source, str) else cv2.CAP_ANY
+        try:
+            source = self._resolve_source()
+        except Exception as e:
+            self.last_error = str(e)[:300]
+            logger.warning("CAM-%02d cannot resolve %s — %s",
+                           self.cam_id, redact(self._url), self.last_error)
+            return None
+        api = cv2.CAP_FFMPEG if isinstance(source, str) else cv2.CAP_ANY
         try:
             params = [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, int(self._open_timeout * 1000),
                       cv2.CAP_PROP_READ_TIMEOUT_MSEC, int(self._stall_timeout * 1000)]
-            cap = cv2.VideoCapture(self._source, api, params)
+            cap = cv2.VideoCapture(source, api, params)
         except Exception:
-            cap = cv2.VideoCapture(self._source, api)   # older OpenCV: no params arg
+            cap = cv2.VideoCapture(source, api)         # older OpenCV: no params arg
         if not cap or not cap.isOpened():
             if cap:
                 cap.release()
@@ -180,11 +261,18 @@ class RtspCapture:
             self._reopen.clear()
             last_decode = 0.0
             last_ok = time.monotonic()
+            # Sleep on the stop event, not time.sleep, so stop() stays prompt.
+            pacer = (_Pacer(self.neg_fps, sleep=self._sleep)
+                     if self.paced else None)
 
             while not self._stop.is_set() and not self._reopen.is_set():
+                if pacer is not None:
+                    pacer.wait()
                 if not cap.grab():
-                    if self._is_file:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)   # loop the file
+                    if self.loop_at_end:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)   # rewind, play again
+                        if pacer is not None:
+                            pacer.reset()
                         continue
                     self.last_error = "grab failed"
                     break

@@ -356,7 +356,8 @@ Everything is in **`config.yaml`**:
 | `model.motion.*` | motion-gate sensitivity (lower = more frames reach the GPU) |
 | `pose.aim_*` | two-handed weapon-posture thresholds |
 | `risk.threshold_high` / `threshold_critical` | alert cutoffs (0–100) |
-| `streams:` | camera sources — `ws` slots for phones, `rtsp://` / webcam index / file paths for pulled cameras (used by both `server.py` and `main.py`) |
+| `streams:` | camera sources — `ws` slots for phones, `rtsp://` / webcam index / file paths / YouTube links for pulled cameras (used by both `server.py` and `main.py`) |
+| `youtube:` | quality cap, looping and link-refresh timing for YouTube sources (needs `yt-dlp`; the only source that uses the internet) |
 
 Local mode without the web UI (OpenCV window; pulls only the non-`ws` entries in
 `streams:`, through the same `RtspCapture` the server uses):

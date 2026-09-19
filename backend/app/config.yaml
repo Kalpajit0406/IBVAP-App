@@ -64,6 +64,7 @@ alerts:
 #   - url: http://ip/video.mjpg          → an MJPEG camera or IP-Webcam app
 #   - url: "0" / "1"                     → a local USB/laptop webcam index
 #   - url: path\to\clip.mp4              → a video file (looped) — offline testing
+#   - url: https://youtube.com/watch?v=… → a YouTube video or live stream
 #   - url: ws   (or omit url)            → a slot a phone connects to via /cam/N
 # `zone_sensitivity` 0.0–1.0 feeds the risk score. `enabled: false` skips a row.
 # `transport` / `decode_fps` override the `cctv:` defaults per camera.
@@ -100,6 +101,31 @@ streams:
     name: "Phone-1"
     url: "ws"
     zone_sensitivity: 0.5
+
+# ── YouTube sources ──────────────────────────────────────────────────────────
+# Paste a watch URL into a stream's `url` and it becomes an ordinary camera:
+# a tile on the dashboard with boxes drawn on it, running through detection,
+# ANPR, face recognition, the fences and the behaviour rules like any other.
+# Useful for testing against footage you do not have a camera for, and for
+# public live feeds. Recorded videos are played at their real speed and start
+# again at the end; live streams are not rewound.
+#
+#   - { id: 2, name: "Highway", url: "https://www.youtube.com/watch?v=XXXXXXXXXXX" }
+#
+# This is the ONE source kind that needs the internet. The traffic is outbound
+# only and opens no inbound port, so the local-only posture is unchanged — but
+# an air-gapped install cannot use it, by definition. Needs `yt-dlp` installed
+# (requirements.txt); it goes stale as YouTube changes, so if every link starts
+# failing at once, update it before looking anywhere else. Age-restricted,
+# members-only and DRM videos will not play. No audio — there never was any.
+youtube:
+  max_height: 720         # cap the stream pulled. Frames are normalised to
+                          # 1280x720 anyway, so more than this is decoded and
+                          # then thrown away — it costs CPU and bandwidth only.
+  loop_vod: true          # replay a recorded video from the start at the end
+  refresh_margin_s: 300   # re-resolve this long before the media link expires
+                          # (YouTube issues them for ~6 h, tied to this machine)
+  resolve_timeout_s: 20   # give up asking YouTube about a link after this long
 
 # ── CCTV / RTSP defaults ─────────────────────────────────────────────────────
 # Applied to every pulled stream unless the stream overrides them.
@@ -224,7 +250,14 @@ model:
   # Detection runs at detect_fps while tracks are carried on every frame by
   # linear extrapolation, so boxes stay smooth between detector passes.
   stream_fps: 24          # source frame rate — also the muxer tick rate
-  detect_fps: 8           # detector passes per second per camera
+  detect_fps: 8           # detector passes per second per camera. A source that
+                          # delivers fewer than ~10 fps (a phone) is the exception:
+                          # every fresh frame is processed once instead of being
+                          # thinned to this rate. Sampling a slow source at a fixed
+                          # rate aliases against its frames — some passes skip one —
+                          # and a person running then jumps further than their own
+                          # box width and the tracker loses them (measured).
+                          # Faster sources, e.g. 25 fps CCTV, are still thinned to it.
 
   # Cheap pre-filter: a static scene never reaches the GPU at all. This is also
   # what drives the dashboard's live/idle state per device — "idle" means the

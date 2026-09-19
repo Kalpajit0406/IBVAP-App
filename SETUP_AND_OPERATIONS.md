@@ -89,13 +89,30 @@ acknowledges all of them.
 **Add CCTV / RTSP Camera**, and fill in:
 
 - **URL** — `rtsp://user:pass@ip:554/stream1`, a plain webcam index (`0`, `1`,
-  …), a video file path (for a demo/test loop), or `screen` for a synthetic
-  screen-capture camera.
+  …), a video file path (for a demo/test loop), a **YouTube link** (see below),
+  or `screen` for a synthetic screen-capture camera.
 - **Zone sensitivity** (0–1) — how readily this camera's zone drives the risk
   score up when someone is in it.
 - **Transport** (`tcp`/`udp`) and **decode FPS** for RTSP sources.
 
 The stream loads immediately — no restart needed.
+
+**YouTube video or live stream** — pick the **YouTube Video / Live Stream**
+preset (or just paste a `https://www.youtube.com/watch?v=…` link) and press
+**Test** to confirm what will play. It then behaves exactly like a camera: it
+appears as a dashboard tile with detection boxes drawn on it, and feeds ANPR,
+face recognition, the virtual fences and the behaviour rules like any other
+source. A recorded video plays at its real speed and repeats when it ends; a
+live stream does not repeat. Useful for testing against footage you have no
+camera for, and for public live feeds.
+
+Worth knowing: this is the only camera kind that needs an internet connection
+(outbound only — it opens nothing to the outside). It needs `yt-dlp` installed
+in the backend's Python (`pip install yt-dlp`), and that package goes stale as
+YouTube changes, so if every link suddenly fails, run `pip install -U yt-dlp`
+before looking anywhere else. Age-restricted, members-only and DRM-protected
+videos will not play, and there is no audio — the pipeline has never had any.
+Use footage you have the right to use.
 
 **Phone camera** — leave a slot's URL as `ws` (the default for an unconfigured
 slot), then on the phone open `https://<this-PC's-LAN-IP>:8443/cam/<id>` in a

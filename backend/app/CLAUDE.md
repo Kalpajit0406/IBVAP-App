@@ -86,10 +86,11 @@ of the server.
 `server.py` opens every entry in `config.yaml` `streams:` on startup, **in the
 same process and pipeline as the phones**. A row with a real `url`
 (`rtsp://…`, `http://…mjpg`, a webcam index, or a `.mp4` to loop) becomes an
-`RtspCapture`; a row with `url: ws` (or no url) stays a WebSocket slot a phone
-connects to. Both land in the `captures` dict and flow through the batched
-muxer → detector → dashboard identically — an NVR channel and a phone are
-indistinguishable downstream.
+`RtspCapture`; a **YouTube** watch URL becomes a `YouTubeCapture`
+(`ibvap/youtube_capture.py`, see below); a row with `url: ws` (or no url) stays
+a WebSocket slot a phone connects to. All of them land in the `captures` dict
+and flow through the batched muxer → detector → dashboard identically — an NVR
+channel, a YouTube link and a phone are indistinguishable downstream.
 
 `RtspCapture` is built for real, flaky cameras: **one decode thread each** (a
 frozen camera never stalls the muxer), **RTSP forced over TCP** with a 5 s
@@ -101,9 +102,39 @@ normalise** to 1280×720, and **credential redaction** in every log line and in
 It is duck-compatible with `WebSocketCapture` (`.read()`, `.connected`,
 `.info()`, `.latency_ms`, …) so nothing else changed.
 
+Two flags on a capture decide how its frames are timed. **`paced`** holds a
+source to its own frame rate (`_Pacer`): a recording demuxes far faster than it
+plays — measured at 45× on a local clip — and an HLS live stream arrives a
+segment at a time, so both need holding back or the picture races and the
+behaviour engine, which measures speed per wall-clock second, reads a walk as a
+sprint. RTSP and webcams are paced by their own socket and are left alone.
+**`loop_at_end`** rewinds instead of reconnecting, for a recording only.
+
 Full operator guide — how college CCTV is wired, vendor RTSP URL tables,
 main vs sub-stream, what to ask IT for, `tools/rtsp_probe.py` /
 `tools/discover_cameras.py` — is **`docs/CCTV_INTEGRATION.md`**.
+
+## YouTube sources (`ibvap/youtube_capture.py`)
+
+A watch URL in a stream's `url` becomes an ordinary camera — a dashboard tile
+with boxes drawn on it, through detection, ANPR, face, fences and behaviour
+like any other. `YouTubeCapture` subclasses `RtspCapture` and only overrides
+**what to open**: `yt-dlp` resolves the link, and `_resolve_source()` (the hook
+in the parent, called fresh on every reopen) hands back the media URL.
+
+Three things that are not obvious. YouTube serves **no muxed formats** — every
+stream is video-only, either a direct `https` MP4 or HLS, so yt-dlp's `best`
+selector matches nothing and `pick_format()` chooses instead (H.264 first, the
+tallest within `youtube.max_height`, a direct URL for a recording so it can
+rewind, HLS for live). **DASH segment manifests are rejected** — OpenCV cannot
+open one. And the media URL **expires after ~6 h and is bound to this machine's
+IP**, so it is re-resolved before the deadline and dropped after any failed
+open; retrying a stale link fails forever.
+
+This is the only source kind that needs the internet — outbound only, no
+inbound port. `yt-dlp` is imported lazily, so without it this one camera
+reports a readable error and nothing else is affected; it also goes stale as
+YouTube changes, so update it first if every link starts failing.
 
 ## Mobile ingestion (phones as demo cameras)
 

@@ -22,6 +22,14 @@ qrcode>=7.4              # tunnel.py QR for the phone link (ASCII, no PIL needed
 # Fast screen capture; tkinter (overlay window) ships with Python on Windows.
 mss>=9.0
 
+# YouTube links as camera sources (ibvap/youtube_capture.py, `youtube:` in
+# config.yaml). Only resolves a watch URL to the media URL OpenCV opens —
+# nothing is downloaded to disk. Imported lazily: without it, a YouTube camera
+# reports a readable error and every other source is unaffected. Goes stale as
+# YouTube changes, so keep it current (`pip install -U yt-dlp`) — a version
+# that worked last month can stop resolving.
+yt-dlp>=2025.1.1
+
 # Dataset fetch (datasets_fetch.py). `gdown` pulls the Google Drive zips for the
 # weapon (YouTube-GDD) and night/thermal (LLVIP) sets; the script prints a manual
 # step if it's absent. `roboflow` / `kaggle` are OPTIONAL — only for adding the

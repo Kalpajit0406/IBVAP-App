@@ -223,6 +223,10 @@ class _StreamsPanelState extends State<StreamsPanel> {
     final isLive = stream['live'] == true;
     final isEnabled = stream['enabled'] == true;
     final isWs = type == 'PHONE' || url == 'ws';
+    final isYouTube = type == 'YOUTUBE';
+    final ytTitle = stream['title']?.toString() ?? '';
+    final ytQuality = stream['quality']?.toString() ?? '';
+    final ytError = stream['last_error']?.toString() ?? '';
 
     // NB: an explicit <String, dynamic>{} is required here — `liveDevices` is
     // reified as List<Map<String, dynamic>> at runtime, so a bare `{}` (which
@@ -258,11 +262,13 @@ class _StreamsPanelState extends State<StreamsPanel> {
             child: Icon(
               isWs
                   ? Icons.phone_android_rounded
-                  : type == 'SCREEN'
-                      ? Icons.desktop_windows_rounded
-                      : type == 'WEBCAM'
-                          ? Icons.camera_alt_rounded
-                          : Icons.videocam_rounded,
+                  : isYouTube
+                      ? Icons.smart_display_rounded
+                      : type == 'SCREEN'
+                          ? Icons.desktop_windows_rounded
+                          : type == 'WEBCAM'
+                              ? Icons.camera_alt_rounded
+                              : Icons.videocam_rounded,
               color: isLive ? IbvapColors.green : IbvapColors.muted,
               size: 22,
             ),
@@ -331,9 +337,26 @@ class _StreamsPanelState extends State<StreamsPanel> {
                 Text(
                   isWs
                       ? 'Mobile WebSocket Slot: https://${_lanIp ?? "127.0.0.1"}:8443/cam/$camId'
-                      : 'URL: $url  •  Transport: ${stream["transport"] ?? "tcp"}  •  Decode: ${stream["decode_fps"] ?? 15} FPS',
+                      : isYouTube
+                          ? 'URL: $url  •  Decode: ${stream["decode_fps"] ?? 15} FPS'
+                          : 'URL: $url  •  Transport: ${stream["transport"] ?? "tcp"}  •  Decode: ${stream["decode_fps"] ?? 15} FPS',
                   style: const TextStyle(color: IbvapColors.muted, fontSize: 11, fontFamily: 'monospace'),
                 ),
+                // What is actually playing — the URL alone is an opaque id.
+                if (isYouTube && (ytTitle.isNotEmpty || ytError.isNotEmpty)) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    ytError.isNotEmpty
+                        ? '⚠  $ytError'
+                        : '▶  $ytTitle'
+                            '${ytQuality.isEmpty ? "" : "  •  $ytQuality"}'
+                            '${stream["is_live"] == true ? "  •  LIVE" : ""}',
+                    style: TextStyle(
+                      color: ytError.isNotEmpty ? IbvapColors.red : IbvapColors.text,
+                      fontSize: 11,
+                    ),
+                  ),
+                ],
                 if (isLive) ...[
                   const SizedBox(height: 2),
                   Text(

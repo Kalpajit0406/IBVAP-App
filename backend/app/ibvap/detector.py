@@ -95,6 +95,12 @@ class _CamState:
     # newest frame on every tick until a new one arrives, so the same array
     # comes back several times; see process_batch.
     last_frame: Optional[np.ndarray] = None
+    # Arrival cadence of NEW frames, in ticks between them (smoothed). It tells a
+    # slow source (a phone at 8 fps) from a fast one (CCTV at 25 fps); see
+    # process_batch for why that changes how passes are scheduled.
+    seen_frame: Optional[np.ndarray] = None
+    seen_tick: int = -1
+    period: float = 0.0
 
 
 
@@ -504,28 +510,44 @@ class Detector:
             st = self._cam(cam_id)
             st.frames += 1
 
+            # How fast do NEW frames arrive for this camera? The muxer hands every
+            # camera its newest frame on each 24 Hz tick, so a slower source
+            # comes back as the same array several times running.
+            if frame is not st.seen_frame:
+                if st.seen_tick >= 0:
+                    gap = float(self._tick - st.seen_tick)
+                    st.period = gap if st.period == 0.0 else 0.8 * st.period + 0.2 * gap
+                st.seen_tick, st.seen_frame = self._tick, frame
+            # A "slow" source delivers a frame at most about every 2.25 ticks
+            # (< ~10.7 fps). Its frames are already scarcer than the detection
+            # rate, so thinning them further is what hurts — see below.
+            slow_source = st.period >= 0.75 * self._detect_every
+
             # 1. Detection-rate limiter, on the shared tick so every camera
-            #    becomes due in the same pass and the batch stays full.
-            if self._tick - st.last_detect_tick < self._detect_every:
+            #    becomes due in the same pass and the batch stays full. Not for
+            #    a slow source: it would sample a phone at ~8 fps at exactly
+            #    8 Hz, and any jitter in when frames arrive makes that sampling
+            #    ALIAS — some passes land on a fresh frame, some see the next
+            #    one after another has come and gone, so the step between the
+            #    frames actually processed alternates between one frame and two.
+            #    A person running (2.5 body-heights/s) then jumps further than
+            #    their own box width on the two-frame steps, ByteTrack loses
+            #    them, and the replacement track (withheld until two matches
+            #    confirm it) is lost again on the next long step. Measured live:
+            #    the model found the runner on every single frame at ~0.87, yet
+            #    one runner became four track ids and `running` never fired.
+            #    So a slow source has EVERY fresh frame processed, once.
+            if not slow_source and self._tick - st.last_detect_tick < self._detect_every:
                 self.stats.frames_rate_skipped += 1
                 to_carry.append((cam_id, ts, frame))
                 continue
 
             # 1b. Never spend a pass, or a motion-gate decision, on a frame that
-            #     was already looked at. The muxer hands every camera its NEWEST
-            #     frame on each 24 Hz tick, so a source slower than that (a phone
-            #     at 8 fps) comes back as the same array again and again. Left
-            #     alone, a pass that fell due on a repeat had the gate see zero
-            #     change, skipped the pass, and still advanced the schedule — so
-            #     the next real pass saw two frames' worth of movement. A person
-            #     running (2.5 body-heights/s) then jumped further than their own
-            #     box width between passes, ByteTrack lost them, and each new
-            #     track started with no learned velocity and lost them again:
-            #     measured live, one runner became four track ids and `running`
-            #     never fired although the model detected them on every frame.
-            #     Now the pass simply waits (the schedule is NOT advanced) and
-            #     runs on the next frame that has actually arrived, so passes
-            #     land on real frame boundaries at an even cadence.
+            #     was already looked at. A repeat has zero change from itself,
+            #     so the gate would read it as "static", skip the pass, and
+            #     advance the schedule — a wasted slot and a false "no motion".
+            #     The pass waits instead (the schedule is not advanced) and runs
+            #     on the next frame that has actually arrived.
             if frame is st.last_frame:
                 self.stats.frames_duplicate += 1
                 to_carry.append((cam_id, ts, frame))

@@ -39,7 +39,7 @@ from fastapi import Body, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
                                Response, StreamingResponse)
 
-from ibvap import ws_capture
+from ibvap import ws_capture, youtube_capture
 from ibvap.alert_forward import AlertForwarder
 from ibvap.behaviour import BehaviourEngine
 from ibvap.calibration import Calibrator
@@ -57,6 +57,7 @@ from ibvap.sinks import event_payload
 from ibvap.snapshots import SnapshotWriter, malicious_postures
 from ibvap.uplink_tuner import UplinkTuner
 from ibvap.ws_capture import WebSocketCapture
+from ibvap.youtube_capture import YouTubeCapture, is_youtube_url
 
 # Windows consoles default to cp1252 and mangle non-ASCII log output
 if sys.platform == "win32":
@@ -219,6 +220,25 @@ async def _lifespan(app: FastAPI):
 _WS_URLS = {"", "ws", "phone", "mobile", "browser"}
 
 
+def _stream_type(url: str) -> str:
+    """The source kind the console shows on a camera card, from the URL alone."""
+    u = str(url).strip()
+    low = u.lower()
+    if low in _WS_URLS:
+        return "phone"
+    if low == "screen":
+        return "screen"
+    if is_youtube_url(u):
+        return "youtube"
+    if low.startswith("rtsp://"):
+        return "rtsp"
+    if low.startswith(("http://", "https://")):
+        return "http"          # https:// used to fall through and read "file"
+    if u.isdigit():
+        return "webcam"
+    return "file"
+
+
 # Dynamic camera edits from the dashboard/app (Add/Edit/Delete Camera) are
 # persisted here, NOT to config.yaml — mirrors data/fences.json. config.yaml
 # stays the pristine, hand-commented seed; once data/streams.json exists it is
@@ -248,6 +268,35 @@ def _save_streams() -> None:
     tmp.write_text(json.dumps({"streams": cfg.get("streams", [])}, indent=2),
                    encoding="utf-8")
     os.replace(tmp, p)
+
+
+def _make_pulled_capture(s: dict, cam_id: int, url: str):
+    """Build (and start) the capture for a stream with a real URL.
+
+    A YouTube link needs its own class because the URL the operator typed is
+    not the one that gets opened; everything else is an RtspCapture.
+    """
+    c = cfg.get("cctv", {}) or {}
+    common = dict(
+        name=s.get("name"),
+        norm_w=NORM_W, norm_h=NORM_H,
+        transport=str(s.get("transport", c.get("transport", "tcp"))),
+        decode_fps=float(s.get("decode_fps", c.get("decode_fps", 15))),
+        reconnect_delay=float(c.get("reconnect_delay", 3.0)),
+        stall_timeout=float(c.get("stall_timeout", 8.0)),
+        open_timeout=float(c.get("open_timeout", 8.0)),
+    )
+    if is_youtube_url(url):
+        y = cfg.get("youtube", {}) or {}
+        return YouTubeCapture(
+            cam_id, url,
+            max_height=int(y.get("max_height", 720)),
+            loop_vod=bool(y.get("loop_vod", True)),
+            refresh_margin_s=float(y.get("refresh_margin_s", 300.0)),
+            resolve_timeout_s=float(y.get("resolve_timeout_s", 20.0)),
+            **common,
+        ).start()
+    return RtspCapture(cam_id, url, **common).start()
 
 
 def _open_configured_streams() -> None:
@@ -302,16 +351,7 @@ def _open_configured_streams() -> None:
             opened_ws += 1
             continue
         try:
-            captures[cam_id] = RtspCapture(
-                cam_id, url,
-                name=s.get("name"),
-                norm_w=NORM_W, norm_h=NORM_H,
-                transport=str(s.get("transport", c.get("transport", "tcp"))),
-                decode_fps=float(s.get("decode_fps", c.get("decode_fps", 15))),
-                reconnect_delay=float(c.get("reconnect_delay", 3.0)),
-                stall_timeout=float(c.get("stall_timeout", 8.0)),
-                open_timeout=float(c.get("open_timeout", 8.0)),
-            ).start()
+            captures[cam_id] = _make_pulled_capture(s, cam_id, url)
             opened_pull += 1
         except Exception as e:
             logger.error("CAM-%02d failed to start (%s): %s",
@@ -661,8 +701,6 @@ def _open_single_stream(s: dict) -> None:
         logger.info("CAM-%02d is disabled", cam_id)
         return
 
-    c = cfg.get("cctv", {}) or {}
-
     if url.lower() == "screen":
         target_fps = float(cfg.get("model", {}).get("stream_fps", 24.0))
         captures[cam_id] = ScreenCapture(
@@ -672,16 +710,7 @@ def _open_single_stream(s: dict) -> None:
         captures[cam_id] = WebSocketCapture(cam_id, norm_w=NORM_W, norm_h=NORM_H)
     else:
         try:
-            captures[cam_id] = RtspCapture(
-                cam_id, url,
-                name=s.get("name"),
-                norm_w=NORM_W, norm_h=NORM_H,
-                transport=str(s.get("transport", c.get("transport", "tcp"))),
-                decode_fps=float(s.get("decode_fps", c.get("decode_fps", 15))),
-                reconnect_delay=float(c.get("reconnect_delay", 3.0)),
-                stall_timeout=float(c.get("stall_timeout", 8.0)),
-                open_timeout=float(c.get("open_timeout", 8.0)),
-            ).start()
+            captures[cam_id] = _make_pulled_capture(s, cam_id, url)
         except Exception as e:
             logger.error("CAM-%02d failed to start (%s): %s", cam_id, redact(url), e)
 
@@ -696,8 +725,8 @@ async def list_streams():
         cap = captures.get(cid)
         url = str(s.get("url", "")).strip()
         is_ws = url.lower() in _WS_URLS
-        stype = "phone" if is_ws else "screen" if url.lower() == "screen" else "rtsp" if url.startswith("rtsp://") else "http" if url.startswith("http://") else "webcam" if url.isdigit() else "file"
-        rows.append({
+        stype = _stream_type(url)
+        row = {
             "id": cid,
             "name": s.get("name", f"CAM-{cid:02d}"),
             "url": redact(url) if url and not is_ws else url,
@@ -710,7 +739,14 @@ async def list_streams():
             "live": cap.connected if cap is not None else False,
             "frames_received": cap.frames_received if cap is not None else 0,
             "phone_url": f"https://{ip}:{HTTPS_PORT}/cam/{cid}" if is_ws else None,
-        })
+        }
+        if isinstance(cap, YouTubeCapture):
+            # What is actually playing, so the console can show it on the card.
+            row["title"] = cap.title
+            row["is_live"] = cap.is_live
+            row["quality"] = cap.quality
+            row["last_error"] = cap.resolve_error or cap.last_error
+        rows.append(row)
     return JSONResponse({
         "lan_ip": ip,
         "https_port": HTTPS_PORT,
@@ -806,6 +842,31 @@ async def delete_stream(cam_id: int):
     return {"deleted": cam_id, "configured": was_configured}
 
 
+async def _probe_youtube(url: str, loop) -> dict:
+    """Ask YouTube what is behind a link, for the console's Test button.
+
+    This needs its own timeout: resolving is a round trip to YouTube that
+    routinely takes a few seconds, while the RTSP probe's 6 s bound exists to
+    stop an unreachable host hanging the dialog. Sharing one number would
+    either report every YouTube link as broken or make a dead camera slow.
+    """
+    y = cfg.get("youtube", {}) or {}
+    timeout = float(y.get("resolve_timeout_s", 20.0))
+
+    def _resolve():
+        return youtube_capture.probe(url,
+                                     max_height=int(y.get("max_height", 720)),
+                                     timeout_s=timeout)
+
+    try:
+        return await asyncio.wait_for(loop.run_in_executor(None, _resolve),
+                                      timeout=timeout + 5.0)
+    except asyncio.TimeoutError:
+        return {"ok": False,
+                "error": f"YouTube did not answer within {timeout + 5.0:.0f}s — "
+                         "check this machine's internet connection."}
+
+
 @app.post("/api/streams/probe")
 async def probe_stream(payload: dict = Body(...)):
     """Test whether an RTSP, HTTP, webcam index or video file URL is reachable."""
@@ -822,6 +883,9 @@ async def probe_stream(payload: dict = Body(...)):
         })
 
     loop = asyncio.get_running_loop()
+
+    if is_youtube_url(url):
+        return JSONResponse(await _probe_youtube(url, loop))
 
     def _test():
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (

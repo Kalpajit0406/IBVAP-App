@@ -96,11 +96,17 @@ class IbvapClient {
   Future<Map<String, dynamic>> deleteStream(int camId) =>
       _sendJson('DELETE', '/api/streams/$camId');
 
+  /// Test a source before saving it. Deliberately far longer than the
+  /// client-wide timeout: the server spends up to 6 s on an unreachable RTSP
+  /// host and up to 25 s asking YouTube about a link, and cutting the call off
+  /// early would report a working camera as broken.
   Future<Map<String, dynamic>> probeStream(String url, {String transport = 'tcp'}) =>
-      _postJson('/api/streams/probe', {'url': url, 'transport': transport});
+      _postJson('/api/streams/probe', {'url': url, 'transport': transport},
+          timeout: const Duration(seconds: 30));
 
   Future<Map<String, dynamic>> discoverLanCameras() =>
-      _postJson('/api/streams/discover', const {});
+      _postJson('/api/streams/discover', const {},
+          timeout: const Duration(seconds: 15));
 
   // ── writes ──────────────────────────────────────────────────────────────
   Future<Map<String, dynamic>> setLayout({
@@ -216,22 +222,27 @@ class IbvapClient {
   }
 
   Future<Map<String, dynamic>> _postJson(
-          String path, Map<String, dynamic> body) =>
-      _sendJson('POST', path, body);
+          String path, Map<String, dynamic> body, {Duration? timeout}) =>
+      _sendJson('POST', path, body: body, timeout: timeout);
 
+  /// [timeout] overrides the client-wide one for a call the server itself is
+  /// allowed to spend longer on — probing a camera, for instance, where the
+  /// default would give up before the server had finished trying.
   Future<Map<String, dynamic>> _sendJson(
     String method,
-    String path, [
+    String path, {
     Map<String, dynamic>? body,
-  ]) async {
+    Duration? timeout,
+  }) async {
     final req = http.Request(method, _cfg.endpoint(path))
       ..headers.addAll(_headers(json: true));
     if (body != null) req.body = jsonEncode(body);
     // The timeout must cover the body too — send() resolves on headers alone,
     // so a server that stalls mid-body would otherwise hang the call forever.
+    final limit = timeout ?? this.timeout;
     final res = await _guard(() async =>
-        http.Response.fromStream(await _client.send(req).timeout(timeout))
-            .timeout(timeout));
+        http.Response.fromStream(await _client.send(req).timeout(limit))
+            .timeout(limit));
     return _decodeObject(res);
   }
 

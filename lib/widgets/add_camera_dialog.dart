@@ -42,6 +42,7 @@ class _AddCameraDialogState extends State<AddCameraDialog> {
     (label: 'Axis (Sub-stream)', template: 'rtsp://admin:password@192.168.1.50/axis-media/media.amp?resolution=640x360'),
     (label: 'Uniview (Sub-stream)', template: 'rtsp://admin:password@192.168.1.50:554/media/video2'),
     (label: 'Android IP Webcam App', template: 'http://192.168.1.50:8080/video'),
+    (label: 'YouTube Video / Live Stream', template: 'https://www.youtube.com/watch?v='),
     (label: 'USB Webcam 0', template: '0'),
     (label: 'USB Webcam 1', template: '1'),
     (label: 'Screen Capture', template: 'screen'),
@@ -60,6 +61,35 @@ class _AddCameraDialogState extends State<AddCameraDialog> {
     _zoneSensitivity = (edit?['zone_sensitivity'] as num?)?.toDouble() ?? 0.7;
     _decodeFps = (edit?['decode_fps'] as num?)?.toDouble() ?? 15.0;
     _enabled = edit?['enabled'] as bool? ?? true;
+  }
+
+  /// Mirrors `is_youtube_url` in backend/app/ibvap/youtube_capture.py. The
+  /// server makes the real decision; this only drives what the form shows.
+  bool get _isYouTube {
+    final u = Uri.tryParse(_urlCtrl.text.trim());
+    if (u == null || (u.scheme != 'http' && u.scheme != 'https')) return false;
+    const hosts = {
+      'youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com',
+      'youtu.be', 'www.youtu.be',
+      'youtube-nocookie.com', 'www.youtube-nocookie.com',
+    };
+    return hosts.contains(u.host.toLowerCase());
+  }
+
+  /// One line describing what the Test button found. Handles all three shapes
+  /// the server returns: a camera (resolution only), a YouTube link (a note
+  /// naming the video, plus resolution) and a phone/screen slot (note only,
+  /// with no resolution to report).
+  String _probeMessage(Map<String, dynamic> r) {
+    if (r['ok'] != true) return 'Connection failed: ${r["error"]}';
+    final detail = <String>[
+      if (r['width'] != null && r['height'] != null) '${r["width"]}x${r["height"]}',
+      if (r['fps'] != null) '${r["fps"]} FPS',
+      if (r['latency_ms'] != null) '${r["latency_ms"]} ms',
+    ].join(' • ');
+    final note = (r['note'] as String?) ?? '';
+    if (note.isNotEmpty) return detail.isEmpty ? note : '$note  •  $detail';
+    return detail.isEmpty ? 'Stream verified!' : 'Stream verified! $detail';
   }
 
   int _nextAvailableId() {
@@ -300,7 +330,7 @@ class _AddCameraDialogState extends State<AddCameraDialog> {
               const SizedBox(height: 14),
 
               // Stream URL + Probe Button
-              const Text('Stream URL (RTSP / HTTP / ws / 0 / screen / file)', style: TextStyle(color: IbvapColors.muted, fontSize: 11)),
+              const Text('Stream URL (RTSP / HTTP / YouTube / ws / 0 / screen / file)', style: TextStyle(color: IbvapColors.muted, fontSize: 11)),
               const SizedBox(height: 6),
               Row(
                 children: [
@@ -308,7 +338,10 @@ class _AddCameraDialogState extends State<AddCameraDialog> {
                     child: TextField(
                       controller: _urlCtrl,
                       style: const TextStyle(color: IbvapColors.text, fontSize: 13, fontFamily: 'monospace'),
-                      decoration: const InputDecoration(hintText: 'rtsp://user:pass@ip:554/... or ws'),
+                      decoration: const InputDecoration(hintText: 'rtsp://user:pass@ip:554/…  ·  https://youtube.com/watch?v=…  ·  ws'),
+                      // The Transport row below is meaningless for a YouTube
+                      // link, so it hides itself as soon as one is typed.
+                      onChanged: (_) => setState(() {}),
                     ),
                   ),
                   const SizedBox(width: 8),
@@ -348,9 +381,7 @@ class _AddCameraDialogState extends State<AddCameraDialog> {
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
-                          _probeResult!['ok'] == true
-                              ? 'Stream verified! Resolution: ${_probeResult!["width"]}x${_probeResult!["height"]} • ${_probeResult!["fps"]} FPS • ${_probeResult!["latency_ms"]} ms'
-                              : 'Connection failed: ${_probeResult!["error"]}',
+                          _probeMessage(_probeResult!),
                           style: TextStyle(
                             color: _probeResult!['ok'] == true ? IbvapColors.green : IbvapColors.red,
                             fontSize: 11.5,
@@ -428,34 +459,50 @@ class _AddCameraDialogState extends State<AddCameraDialog> {
               // Transport & Decode FPS & Zone Sensitivity
               Row(
                 children: [
+                  // RTSP transport means nothing to a YouTube link — say what
+                  // the source will actually do instead of offering a dead control.
                   Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text('Transport Protocol', style: TextStyle(color: IbvapColors.muted, fontSize: 11)),
-                        const SizedBox(height: 6),
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 10),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFF1E293B),
-                            borderRadius: BorderRadius.circular(kRadius),
-                            border: Border.all(color: IbvapColors.border),
+                    child: _isYouTube
+                        ? Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: const [
+                              Text('YouTube Source', style: TextStyle(color: IbvapColors.muted, fontSize: 11)),
+                              SizedBox(height: 6),
+                              Text(
+                                'Analysed like any camera. A recorded video plays at '
+                                'its real speed and repeats; a live stream does not '
+                                'repeat. Needs an internet connection.',
+                                style: TextStyle(color: IbvapColors.muted, fontSize: 11, height: 1.35),
+                              ),
+                            ],
+                          )
+                        : Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text('Transport Protocol', style: TextStyle(color: IbvapColors.muted, fontSize: 11)),
+                              const SizedBox(height: 6),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 10),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF1E293B),
+                                  borderRadius: BorderRadius.circular(kRadius),
+                                  border: Border.all(color: IbvapColors.border),
+                                ),
+                                child: DropdownButtonHideUnderline(
+                                  child: DropdownButton<String>(
+                                    isExpanded: true,
+                                    value: _transport,
+                                    dropdownColor: const Color(0xFF1E293B),
+                                    items: const [
+                                      DropdownMenuItem(value: 'tcp', child: Text('TCP (Reliable, No Tears)', style: TextStyle(fontSize: 12))),
+                                      DropdownMenuItem(value: 'udp', child: Text('UDP (Low Latency)', style: TextStyle(fontSize: 12))),
+                                    ],
+                                    onChanged: (v) => setState(() => _transport = v ?? 'tcp'),
+                                  ),
+                                ),
+                              ),
+                            ],
                           ),
-                          child: DropdownButtonHideUnderline(
-                            child: DropdownButton<String>(
-                              isExpanded: true,
-                              value: _transport,
-                              dropdownColor: const Color(0xFF1E293B),
-                              items: const [
-                                DropdownMenuItem(value: 'tcp', child: Text('TCP (Reliable, No Tears)', style: TextStyle(fontSize: 12))),
-                                DropdownMenuItem(value: 'udp', child: Text('UDP (Low Latency)', style: TextStyle(fontSize: 12))),
-                              ],
-                              onChanged: (v) => setState(() => _transport = v ?? 'tcp'),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
                   ),
                   const SizedBox(width: 12),
                   Expanded(
@@ -481,21 +528,30 @@ class _AddCameraDialogState extends State<AddCameraDialog> {
               const Divider(color: IbvapColors.border, height: 1),
               const SizedBox(height: 16),
 
-              // Action Buttons
+              // Action Buttons.
+              // The checkbox group takes the leftover width rather than its
+              // natural width: at the dialog's 572px these three wanted 602
+              // between them, and Save was clipped by 30px.
               Row(
                 children: [
-                  Row(
-                    children: [
-                      Checkbox(
-                        value: _enabled,
-                        activeColor: IbvapColors.green,
-                        checkColor: Colors.black,
-                        onChanged: (v) => setState(() => _enabled = v ?? true),
-                      ),
-                      const Text('Enable Stream', style: TextStyle(color: IbvapColors.text, fontSize: 12)),
-                    ],
+                  Expanded(
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Checkbox(
+                          value: _enabled,
+                          activeColor: IbvapColors.green,
+                          checkColor: Colors.black,
+                          onChanged: (v) => setState(() => _enabled = v ?? true),
+                        ),
+                        const Flexible(
+                          child: Text('Enable Stream',
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(color: IbvapColors.text, fontSize: 12)),
+                        ),
+                      ],
+                    ),
                   ),
-                  const Spacer(),
                   TextButton(
                     onPressed: () => Navigator.pop(context),
                     child: const Text('Cancel'),
