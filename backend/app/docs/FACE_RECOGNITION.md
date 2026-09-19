@@ -221,13 +221,15 @@ satisfy the feature this pass covers.
   problem; pixels on the face are (q0.55 → q0.40 costs only ~0.03-0.07).
 
   Send resolution is no longer a fixed constant — `ibvap/uplink_tuner.py`
-  chooses it per camera from measured latency (`ingest.adaptive`). Its ladder
-  deliberately **gives up frame rate before resolution**, because a burst needs
-  only a handful of good frames over several seconds while range depends
-  directly on pixels: 1280×720@4 costs about the same bitrate as 960×540@8 and
-  recognises people considerably further away. Range therefore varies with link
-  quality — the rung in use is drawn on the video overlay next to the latency,
-  and is in `/status` under `uplink`.
+  chooses it per camera from measured latency (`ingest.adaptive`). Range
+  depends directly on pixels, so it varies with link quality — the rung in use
+  is drawn on the video overlay next to the latency, and is in `/status` under
+  `uplink`. The ladder trades resolution and JPEG quality for bitrate but
+  **holds 8 fps** on every rung except the last-resort one. Face recognition
+  alone would tolerate far fewer frames, but the tracker would not: below ~6 fps
+  it loses a person who is running (measured: one runner became 11 track ids at
+  4 fps, 1 at 8 fps), and running detection and tripwire crossings depend on
+  tracks.
 - **No liveness / anti-spoof check.** A printed photo or a phone/tablet
   screen held up to the camera can also match. This is a known gap, not
   addressed this pass — a real security deployment needs a liveness check

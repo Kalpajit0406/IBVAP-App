@@ -13,11 +13,11 @@ Why rungs rather than continuous control. Changing the canvas size mid-stream is
 visible and cheap to get wrong; a short ladder of vetted operating points is
 easier to reason about and to explain to an operator watching the overlay.
 
-Which knob gives way first. Frame rate, always. Face recognition needs *pixels
-on the face* — a burst only needs a handful of good frames over several seconds,
-so halving fps costs recognition almost nothing while buying bitrate linearly.
-Halving resolution costs recognition range directly. So the ladder drops fps
-before it drops resolution, and climbs back to resolution first.
+Which knob gives way first. Face recognition needs *pixels on the face*, and a
+burst only needs a handful of good frames over several seconds, so it is happy at
+a low frame rate. TRACKING is not: see the note on DEFAULT_RUNGS. So the ladder
+holds the frame rate at a tracking-safe 8 fps on every rung but the last-resort
+one, and gives up resolution and JPEG quality to save bitrate instead.
 
 The credit loop in static/camera.html already bounds latency by construction;
 this only chooses how much detail fits inside that bound.
@@ -44,14 +44,26 @@ class Rung:
         return f"{self.w}x{self.h}@{self.fps}"
 
 
-# Bitrates are measured-ish estimates for a typical indoor scene: bytes/frame
-# scales roughly with pixel count at a fixed quality.
+# Bitrate = bytes/frame x fps, with roughly 25 KB per frame at 640x360, 52 KB at
+# 960x540 and 90 KB at 1280x720 for the qualities below, in a typical indoor scene.
+#
+# The frame rate is HELD at 8 fps on every rung except the last-resort one. That
+# is measured, not a preference. The tracker matches a person between pictures by
+# how much their boxes overlap, and below ~6 fps a person who is running
+# (2.5 body-heights/s) moves further than their own width between frames. Then
+# ByteTrack loses them every single frame: through the real detector one runner
+# became 11 different track ids at 4 fps and 8 at 3 fps, against 1 at 8 fps and
+# above. Everything built on tracks goes with it — running detection, and a
+# person sprinting across a tripwire would not register as crossing it. Walking
+# is fine at 4 fps; it is exactly the fast intruder who matters most that breaks.
+# (Real CCTV delivers 15-25 fps, so this is a phone-over-hotspot concern.)
 DEFAULT_RUNGS = [
-    Rung(640, 360, 2, 0.45, 0.4),
-    Rung(960, 540, 3, 0.50, 1.1),
-    Rung(960, 540, 4, 0.55, 1.7),     # start here — conservative but usable
-    Rung(1280, 720, 4, 0.60, 2.9),
-    Rung(1280, 720, 6, 0.62, 4.6),
+    Rung(640, 360, 4, 0.45, 0.8),     # survival only: the link is failing, and
+                                      # fast movers will not track at this rate
+    Rung(640, 360, 8, 0.50, 1.7),
+    Rung(960, 540, 8, 0.55, 3.3),     # start here
+    Rung(1280, 720, 8, 0.60, 5.8),
+    Rung(1280, 720, 10, 0.62, 7.6),
 ]
 
 

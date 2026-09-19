@@ -91,6 +91,10 @@ class _CamState:
     vehicle_count: int = 0
     infer_count: int = 0
     gated_count: int = 0
+    # The last frame that reached the motion gate. The muxer re-feeds a camera's
+    # newest frame on every tick until a new one arrives, so the same array
+    # comes back several times; see process_batch.
+    last_frame: Optional[np.ndarray] = None
 
 
 
@@ -101,6 +105,7 @@ class PipelineStats:
     frames_inferred: int = 0      # frames that went through the model
     frames_gated: int = 0         # skipped by motion gate
     frames_rate_skipped: int = 0  # skipped by the detection-rate limiter
+    frames_duplicate: int = 0     # the same frame handed in again, awaiting a new one
     batch_total: int = 0          # sum of batch sizes, for the mean
     last_batch: int = 0
     padded_frames: int = 0        # blanks added to reach a fixed batch shape
@@ -117,7 +122,8 @@ class PipelineStats:
         """Share of incoming frames the GPU never had to look at."""
         if not self.frames_in:
             return 0.0
-        return 100.0 * (self.frames_gated + self.frames_rate_skipped) / self.frames_in
+        return 100.0 * (self.frames_gated + self.frames_rate_skipped
+                        + self.frames_duplicate) / self.frames_in
 
 
 def _wrists(d) -> list:
@@ -504,6 +510,27 @@ class Detector:
                 self.stats.frames_rate_skipped += 1
                 to_carry.append((cam_id, ts, frame))
                 continue
+
+            # 1b. Never spend a pass, or a motion-gate decision, on a frame that
+            #     was already looked at. The muxer hands every camera its NEWEST
+            #     frame on each 24 Hz tick, so a source slower than that (a phone
+            #     at 8 fps) comes back as the same array again and again. Left
+            #     alone, a pass that fell due on a repeat had the gate see zero
+            #     change, skipped the pass, and still advanced the schedule — so
+            #     the next real pass saw two frames' worth of movement. A person
+            #     running (2.5 body-heights/s) then jumped further than their own
+            #     box width between passes, ByteTrack lost them, and each new
+            #     track started with no learned velocity and lost them again:
+            #     measured live, one runner became four track ids and `running`
+            #     never fired although the model detected them on every frame.
+            #     Now the pass simply waits (the schedule is NOT advanced) and
+            #     runs on the next frame that has actually arrived, so passes
+            #     land on real frame boundaries at an even cadence.
+            if frame is st.last_frame:
+                self.stats.frames_duplicate += 1
+                to_carry.append((cam_id, ts, frame))
+                continue
+            st.last_frame = frame
 
             # 2. Motion gate — sub-millisecond, still far cheaper than the GPU.
             if self._motion_gating and not st.gate.should_detect(frame):

@@ -27,6 +27,7 @@ class Fence {
     this.armedFrom = '',
     this.armedTo = '',
     this.inbound = '',
+    this.followWindowS = 0,
     this.extra = const {},
   });
 
@@ -37,7 +38,7 @@ class Fence {
   static const _known = {
     'id', 'cam_id', 'kind', 'points', 'direction', 'targets', 'label',
     'enabled', 'severity', 'loiter_after_s', 'armed_from', 'armed_to',
-    'inbound',
+    'inbound', 'follow_window_s',
   };
 
   final String? id;
@@ -66,6 +67,12 @@ class Fence {
   /// person who drew the line says it is. Lines only.
   final String inbound;
 
+  /// Lines only: raise a close-following alert when a second target of the
+  /// same kind crosses the same way within this many seconds of another. 0 =
+  /// off. It reports a pattern (two crossings close together), not a verdict —
+  /// vision cannot tell whether the first crosser was authorised.
+  final double followWindowS;
+
   /// Keys the console does not manage, preserved verbatim across a save.
   final Map<String, dynamic> extra;
 
@@ -79,6 +86,7 @@ class Fence {
       }
     }
     final loiter = j['loiter_after_s'];
+    final follow = j['follow_window_s'];
     return Fence(
       id: j['id']?.toString(),
       camId: (j['cam_id'] as num?)?.toInt() ?? 0,
@@ -95,6 +103,7 @@ class Fence {
       armedFrom: (j['armed_from'] ?? '').toString(),
       armedTo: (j['armed_to'] ?? '').toString(),
       inbound: (j['inbound'] ?? '').toString(),
+      followWindowS: follow is num ? follow.toDouble() : 0,
       extra: {
         for (final e in j.entries)
           if (!_known.contains(e.key)) e.key: e.value,
@@ -122,6 +131,7 @@ class Fence {
         'armed_from': armedFrom,
         'armed_to': armedTo,
         'inbound': inbound,
+        'follow_window_s': followWindowS,
       };
 
   Fence copyWith({
@@ -138,6 +148,7 @@ class Fence {
     String? armedFrom,
     String? armedTo,
     String? inbound,
+    double? followWindowS,
     Map<String, dynamic>? extra,
   }) =>
       Fence(
@@ -154,6 +165,7 @@ class Fence {
         armedFrom: armedFrom ?? this.armedFrom,
         armedTo: armedTo ?? this.armedTo,
         inbound: inbound ?? this.inbound,
+        followWindowS: followWindowS ?? this.followWindowS,
         extra: extra ?? this.extra,
       );
 }

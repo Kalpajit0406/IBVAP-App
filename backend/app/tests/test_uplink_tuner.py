@@ -48,22 +48,27 @@ def _settle(t, cam_id, latency, now, steps=6, fps=None, step_s=1.0):
 @case("cold start is the configured conservative rung")
 def _():
     t = _t()
-    t.observe(0, 100, 4, True, now=0.0)
-    assert t.rung(0).label == "960x540@4"
+    t.observe(0, 100, 8, True, now=0.0)
+    assert t.rung(0).label == "960x540@8"
 
 
-@case("the ladder sacrifices frame rate before resolution")
+@case("the ladder holds a tracking-safe frame rate on every rung but the last resort")
 def _():
-    # Recognition needs pixels on the face far more than it needs frames, so
-    # every downward step should drop fps first and width only when it must.
+    # Measured through the real detector: below ~6 fps ByteTrack loses a person
+    # who is running (one runner became 11 track ids at 4 fps, 1 at 8 fps), and
+    # a sprinter would then not register as crossing a tripwire. So only the
+    # survival rung may go below it; every other step trades resolution/quality.
     t = _t()
+    assert all(r.fps >= 8 for r in t.rungs[1:]), [r.label for r in t.rungs]
+    assert t.rungs[0].fps >= 4
     widths = [r.w for r in t.rungs]
     assert widths == sorted(widths), "rungs must be ordered worst -> best"
     for lo, hi in zip(t.rungs, t.rungs[1:]):
         assert (hi.w, hi.fps) >= (lo.w, lo.fps)
-        if hi.w == lo.w:
-            assert hi.fps > lo.fps       # same size, more frames
+        assert hi.mbps > lo.mbps, "a better rung must cost more bandwidth"
     assert t.rungs[-1].w >= t.rungs[0].w * 2
+    # The cold start is a rung a tracker can follow a runner on.
+    assert t.rungs[t.start_rung].fps >= 8
 
 
 @case("sustained high latency demotes one rung")
@@ -88,7 +93,7 @@ def _():
 def _():
     t = _t(start_rung=4)
     _settle(t, 0, latency=6000, now=0.0, steps=2, step_s=3.0)
-    assert t.rung(0).label == "960x540@4", t.rung(0).label
+    assert t.rung(0).label == "960x540@8", t.rung(0).label
 
 
 @case("latency in the dead band neither demotes nor promotes")

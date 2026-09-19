@@ -12,7 +12,7 @@ never left the process that drew it.
     python scripts/alert_sink.py --fail          # refuse everything, to show
                                                  # the queue build up and drain
 
-Open http://localhost:9000/ in a browser for the live list.
+Open http://127.0.0.1:9000/ in a browser for the live list.
 
 This is a demo and test tool, not part of the product: no auth, no TLS, keeps
 the last few hundred alerts in memory. Do not expose it beyond the laptop.
@@ -162,9 +162,9 @@ def main() -> None:
 
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     print("=" * 72)
-    print(f"  IBVAP alert sink listening on http://localhost:{a.port}")
+    print(f"  IBVAP alert sink listening on http://127.0.0.1:{a.port}")
     print(f"  Point config.yaml alerts.sinks[].url at "
-          f"http://localhost:{a.port}/alert")
+          f"http://127.0.0.1:{a.port}/alert")
     if a.fail:
         print("  --fail: every delivery will be REFUSED (queue should build up)")
     print("=" * 72, flush=True)

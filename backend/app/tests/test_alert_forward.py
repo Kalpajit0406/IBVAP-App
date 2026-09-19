@@ -195,6 +195,20 @@ def _():
     assert p["event_id"] and len(p["event_id"]) == 26
 
 
+@case("a webhook to 'localhost' is sent to 127.0.0.1 (Windows IPv6 fallback costs ~2 s per delivery)")
+def _():
+    from ibvap.sinks import WebhookSink
+    fix = lambda u: WebhookSink({"enabled": True, "url": u}).url
+    assert fix("http://localhost:9000/alert") == "http://127.0.0.1:9000/alert"
+    assert fix("http://LocalHost/x?a=1") == "http://127.0.0.1/x?a=1"
+    assert fix("https://user:pw@localhost:8443/hook") == "https://user:pw@127.0.0.1:8443/hook"
+    # Only the host is touched.
+    assert fix("http://10.0.0.5:9000/alert") == "http://10.0.0.5:9000/alert"
+    assert fix("https://c2.example.org/localhost") == "https://c2.example.org/localhost"
+    assert fix("http://localhost.example.org/x") == "http://localhost.example.org/x"
+    assert WebhookSink({"enabled": True, "url": "http://localhost:9000/a"}).enabled is True
+
+
 @case("severity ordering is total and Info is the floor")
 def _():
     order = ["Info", "Low", "Medium", "High", "Critical"]

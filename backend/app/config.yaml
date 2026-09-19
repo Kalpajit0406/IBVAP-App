@@ -16,7 +16,7 @@ site:
 # rather than an error: the forwarder drains it in order when the link returns.
 #
 # Try it on one laptop:   python scripts/alert_sink.py
-# then set url below to   http://localhost:9000/alert
+# then set url below to   http://127.0.0.1:9000/alert
 alerts:
   enabled: true
   poll_interval_s: 1.0
@@ -34,7 +34,7 @@ alerts:
     - type: webhook
       label: "C2 webhook"
       enabled: false            # set true and point url at your endpoint
-      url: "http://localhost:9000/alert"
+      url: "http://127.0.0.1:9000/alert"
       min_severity: "High"      # Info | Low | Medium | High | Critical
       timeout_s: 5.0
       verify_tls: true          # false only for a private/self-signed CA
@@ -133,9 +133,14 @@ ingest:
   # sit in kernel and Wi-Fi driver queues), so the server — which measures the
   # real capture→receive delay and can see every camera at once — picks each
   # phone's resolution/fps/quality and pushes it down the same socket.
-  # Frame rate is always sacrificed before resolution: a recognition burst needs
-  # only a few good frames over several seconds, but face range depends directly
-  # on pixels, so halving fps costs almost nothing and halving width costs a lot.
+  # The ladder holds 8 fps on every rung but the last-resort one and gives up
+  # resolution / JPEG quality instead. That is measured: the tracker follows a
+  # person by box overlap, and below ~6 fps a runner moves further than their own
+  # width between frames, so ByteTrack loses them every frame (one runner became
+  # 11 track ids at 4 fps, 1 at 8 fps). Running detection and a sprinter
+  # registering at a tripwire both depend on it. Face recognition alone would
+  # tolerate a much lower rate, which is what the old ladder assumed. Override
+  # the rungs with `ingest.rungs` if your cameras are all walking-pace scenes.
   adaptive: true
   max_in_flight: 2          # unacked frames a phone may hold (bounds latency)
   start_rung: 2             # cold start conservative; a good link earns its way up
@@ -590,6 +595,14 @@ geofence:
   #   armed_from /    local-time window "HH:MM" this fence is live, e.g.
   #   armed_to        18:00→06:00 for a gate that is legitimately busy by day.
   #                   Equal or unset = always armed. Crosses midnight correctly.
+  #   follow_window_s (tripwire lines only) raise a `close_following` alert when a
+  #                   second target of the same kind crosses the same way within
+  #                   this many seconds of another (0 = off, the default). It is
+  #                   the vision-only form of tailgating: vision cannot see
+  #                   whether the first person was authorised, so this reports a
+  #                   PATTERN, not a verdict — and at a gate where people
+  #                   legitimately walk through in pairs it will fire. Its
+  #                   severity is `behaviour.following.severity`.
   #   inbound         "a2b" | "b2a" — which crossing direction counts as *into*
   #                   our territory. There is no camera calibration and so no
   #                   true geo-projection: this is whatever the person who drew
@@ -614,7 +627,72 @@ snapshots:
   on_breach: true
   on_weapon: true
   on_posture: true         # crouching / lying
+  on_loiter: true          # standing in a fence past its loiter time
+  on_running: true         # behaviour: someone running
+  on_group: true           # behaviour: people gathering
+  on_following: true       # a second crosser right behind the first at a tripwire
   escalate_posture: false  # also force the camera's risk level to Critical on a malicious posture
+
+# ── Behaviour rules (ibvap/behaviour.py) ─────────────────────────────────────
+# Rules on how tracked people MOVE relative to the scene and each other, read
+# from the tracks the detector already makes — no extra model, no GPU cost.
+#
+# READ THIS BEFORE RELYING ON THEM: these are heuristics, and no false-alarm
+# rate has been measured for any of them yet. That is why every event defaults
+# to Medium and none can reach Critical on its own — the standing rule that a
+# detected person alone is never Critical applies to how they move as much as to
+# whether they are there. Tune on real footage from the post; a rule that cries
+# wolf gets switched off. Events go to the event store, evidence chain, snapshots
+# and (at or above each sink's min_severity) the alert sinks. To see Medium events
+# at a sink, lower that sink's `min_severity` from High to Medium.
+#
+# These rules depend on the tracker holding on to a moving person, which needs
+# frames to arrive fast enough: at 8 fps or more a runner keeps one track id; at
+# 4 fps the tracker loses them every frame and `running` cannot fire (measured).
+# Real CCTV delivers 15-25 fps. Phones are held at 8 fps by the uplink ladder in
+# `ingest:` for exactly this reason.
+#
+# Distances and speeds are in BODY-HEIGHTS (a person's own box height), which
+# cancels most of the perspective difference between someone near the horizon
+# and someone at the fence without needing camera calibration. Walking is about
+# 0.8 body-heights/s, a jog 1.5, a run 2 or more.
+behaviour:
+  enabled: true
+  min_track_passes: 3        # a person must be tracked this many passes first —
+                             # one spurious detection cannot start a group
+  min_box_height_frac: 0.06  # ignore people smaller than this fraction of frame
+                             # height; box jitter reads as movement at that size
+  track_grace_s: 3.0         # how long a vanished person's history is kept
+
+  running:
+    enabled: true
+    speed_bh_s: 2.0          # net speed across the window that counts as running
+    window_s: 1.0            # speed is measured over this long (net displacement,
+                             # not summed steps: jitter cancels over a second)
+    sustain_passes: 3        # ...for this many consecutive detection passes
+    glitch_bh_s: 6.0         # a single-step speed above this is a tracker jump
+                             # (two people swapped), not a person: history restarts
+    cooldown_s: 30.0         # per person, so a stutter is one alert not a stream
+    overlay_hold_s: 1.5      # how long the RUNNING label stays on the video
+    severity: "Medium"
+
+  group:
+    enabled: true
+    radius_bh: 1.5           # two people within this many body-heights are linked;
+                             # links chain, so a strung-out huddle is one group
+    min_size: 3
+    min_duration_s: 3.0      # together this long before it is reported
+    grace_s: 2.0             # how long a group may flicker apart and stay "the same"
+    cooldown_s: 60.0         # per camera: a gathering that re-forms is one event
+                             # (a queue at a check post WILL trip this — raise
+                             # min_size or min_duration_s, or disable it, there)
+    severity: "Medium"
+
+  # Close-following crossing (the vision-only form of tailgating) is switched on
+  # per fence with `follow_window_s` on a tripwire — see the geofence: section.
+  # Only its severity lives here.
+  following:
+    severity: "Medium"
 
 # ── Continuous learning ─────────────────────────────────────────────────────
 # The pipeline continuously mines training examples from every stream (and from

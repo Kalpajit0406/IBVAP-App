@@ -488,7 +488,18 @@ void main() {
       expect(f.loiterAfterS, 0);
       expect(f.armedFrom, '');
       expect(f.inbound, '');
+      expect(f.followWindowS, 0);
       expect(f.extra, isEmpty);
+    });
+
+    test('Fence round-trips the close-following window', () {
+      final back = Fence.fromJson(Fence(
+        camId: 0,
+        kind: 'line',
+        points: [(0.5, 0.1), (0.5, 0.9)],
+        followWindowS: 2.5,
+      ).toJson());
+      expect(back.followWindowS, 2.5);
     });
   });
 
@@ -625,6 +636,32 @@ void main() {
       expect(posted, isEmpty, reason: 'nothing may be sent while invalid');
     });
 
+    test('the close-following window is edited on a line and validated', () async {
+      final line = _serverFence('f_l')
+        ..['kind'] = 'line'
+        ..['points'] = [[0.5, 0.1], [0.5, 0.9]]
+        ..['direction'] = 'a2b'
+        ..['follow_window_s'] = 3.0;
+      final (ed, posted) =
+          await _fenceEditor([line, _serverFence('f_z', cam: 1)]);
+
+      ed.startEdit('f_l');
+      expect(ed.followText, '3');
+      ed.setFollowText('abc');
+      expect(ed.settingsError, contains('Follow'));
+      expect(ed.canSave, isFalse);
+      ed.setFollowText('700');
+      expect(ed.settingsError, contains('Follow'));
+      ed.setFollowText('2.5');
+      expect(ed.settingsError, isNull);
+      expect(await ed.save(), isNull);
+
+      final sent = (posted.single['fences'] as List).cast<Map<String, dynamic>>();
+      expect(sent.firstWhere((f) => f['id'] == 'f_l')['follow_window_s'], 2.5);
+      // A fence that never set a window keeps "off" rather than gaining one.
+      expect(sent.firstWhere((f) => f['id'] == 'f_z')['follow_window_s'], 0.0);
+    });
+
     testWidgets('the form shows the settings, follows an edit, and feeds the editor',
         (tester) async {
       tester.view.physicalSize = const Size(700, 1600);
@@ -658,6 +695,10 @@ void main() {
       // Typing reaches the editor.
       final loiter = find.widgetWithText(TextField, 'Loiter alert after (seconds)');
       expect(loiter, findsOneWidget);
+      // Close-following is a tripwire setting: a zone must not offer it.
+      final follow =
+          find.widgetWithText(TextField, 'Flag close-following within (seconds)');
+      expect(follow, findsNothing);
       await tester.enterText(loiter, '30');
       expect(state.fences.loiterText, '30');
 
@@ -678,6 +719,9 @@ void main() {
       expect(find.text('Inbound: not set'), findsOneWidget);
       expect(find.widgetWithText(TextField, 'Loiter alert after (seconds)'),
           findsNothing);
+      expect(follow, findsOneWidget);
+      await tester.enterText(follow, '4');
+      expect(state.fences.followText, '4');
       expect(tester.takeException(), isNull);
     });
   });

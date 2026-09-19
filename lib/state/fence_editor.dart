@@ -36,6 +36,7 @@ class FenceEditor extends ChangeNotifier {
   String armedFrom = ''; // "HH:MM" local time; blank = always armed
   String armedTo = '';
   String inbound = ''; // '' | 'a2b' | 'b2a'  (lines only)
+  String followText = ''; // seconds; blank / 0 = off  (lines only)
   final List<(double, double)> draft = [];
 
   /// Bumped whenever a draft is loaded, started or cancelled. The form's text
@@ -56,6 +57,13 @@ class FenceEditor extends ChangeNotifier {
       final v = double.tryParse(t);
       if (v == null || v < 0 || v > 86400) {
         return 'Loiter time must be 0–86400 seconds';
+      }
+    }
+    final f = followText.trim();
+    if (f.isNotEmpty) {
+      final v = double.tryParse(f);
+      if (v == null || v < 0 || v > 600) {
+        return 'Follow window must be 0–600 seconds';
       }
     }
     final from = armedFrom.trim(), to = armedTo.trim();
@@ -98,7 +106,13 @@ class FenceEditor extends ChangeNotifier {
     armedFrom = '';
     armedTo = '';
     inbound = '';
+    followText = '';
   }
+
+  /// Seconds as the operator would type them: 30.0 -> "30", 0 -> blank.
+  static String _secondsText(double v) => v <= 0
+      ? ''
+      : (v == v.roundToDouble() ? v.round().toString() : v.toString());
 
   void startDraw(int cam, String kind) {
     armed = true;
@@ -124,11 +138,8 @@ class FenceEditor extends ChangeNotifier {
     label = f.label;
     severity = Fence.severities.contains(f.severity) ? f.severity : 'Critical';
     // 30.0 shows as "30"; 0 shows as blank rather than a stray "0".
-    loiterText = f.loiterAfterS <= 0
-        ? ''
-        : (f.loiterAfterS == f.loiterAfterS.roundToDouble()
-            ? f.loiterAfterS.round().toString()
-            : f.loiterAfterS.toString());
+    loiterText = _secondsText(f.loiterAfterS);
+    followText = _secondsText(f.followWindowS);
     armedFrom = f.armedFrom;
     armedTo = f.armedTo;
     inbound = f.inbound;
@@ -200,6 +211,11 @@ class FenceEditor extends ChangeNotifier {
     notifyListeners();
   }
 
+  void setFollowText(String t) {
+    followText = t;
+    notifyListeners();
+  }
+
   void setArmedFrom(String t) {
     armedFrom = t;
     notifyListeners();
@@ -234,6 +250,7 @@ class FenceEditor extends ChangeNotifier {
       enabled: true,
       severity: severity,
       loiterAfterS: double.tryParse(loiterText.trim()) ?? 0,
+      followWindowS: double.tryParse(followText.trim()) ?? 0,
       armedFrom: armedFrom.trim(),
       armedTo: armedTo.trim(),
       inbound: inbound,

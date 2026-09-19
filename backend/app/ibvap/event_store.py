@@ -18,8 +18,8 @@ SCHEMA_VERSION = 2
 # could filter "everything Critical" or "every intrusion". They are separate
 # now; `level` is still written, unchanged, for anything reading the old column.
 SEVERITIES = ("Info", "Low", "Medium", "High", "Critical")
-CATEGORIES = ("risk", "intrusion", "loiter", "crossing",
-              "weapon", "posture", "face_match", "plate")
+CATEGORIES = ("risk", "intrusion", "loiter", "crossing", "running", "group",
+              "following", "weapon", "posture", "face_match", "plate")
 
 # Reproduces the exact legacy `level` value each call site used to pass, so the
 # old column keeps its historical meaning rather than silently changing.

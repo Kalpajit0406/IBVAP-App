@@ -41,6 +41,7 @@ from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
 
 from ibvap import ws_capture
 from ibvap.alert_forward import AlertForwarder
+from ibvap.behaviour import BehaviourEngine
 from ibvap.calibration import Calibrator
 from ibvap.detector import Detector
 from ibvap.event_store import EventStore
@@ -126,6 +127,7 @@ _geofence_fences: dict[int, list] = {}     # cam_id -> [{id,kind,points,label,di
 _geofence_active: dict[int, dict] = {}     # cam_id -> {fence_id: is_breaching}
 _geofence_crossings: dict = {}             # today's per-fence, per-direction tallies
 _geofence_dwelling: list = []              # who is inside a zone right now
+_behaviour: BehaviourEngine | None = None  # running / group rules; set by the worker
 
 # Hand-off from the muxer thread to the inference worker thread. Depth 1: the
 # worker always gets the freshest snapshot; if it falls behind, the muxer drops
@@ -1685,6 +1687,7 @@ async def status():
             "frames_inferred": _stats.get("frames_inferred", 0),
             "frames_gated": _stats.get("frames_gated", 0),
             "frames_rate_skipped": _stats.get("frames_rate_skipped", 0),
+            "frames_duplicate": _stats.get("frames_duplicate", 0),
             "gpu_saving_pct": round(_stats.get("gpu_saving_pct", 0.0), 1),
         },
         "buffered_bgr": {cid: True for cid in _latest_bgr},
@@ -1707,6 +1710,8 @@ async def status():
         "uplink": _tuner.status(),
         "alerts": (_forwarder.status() if _forwarder is not None
                    else {"enabled": False}),
+        "behaviour": (_behaviour.status() if _behaviour is not None
+                      else {"enabled": False}),
         "face_results": (_detector.face_results.status()
                          if _detector is not None and getattr(_detector, "face_results", None)
                          else {"enabled": False}),
@@ -1857,7 +1862,7 @@ def _muxer_loop() -> None:
 # the muxer keeps ticking, and video/detection degrade gracefully instead of
 # stalling the ingest.
 def _inference_worker() -> None:
-    global _detector, _event_store, _harvester, _calibrator, _snapshots
+    global _detector, _event_store, _harvester, _calibrator, _snapshots, _behaviour
     learn_cfg = cfg.get("learning", {}) or {}
     _calibrator = (Calibrator(cfg)
                    if learn_cfg.get("calibration", {}).get("enabled") else None)
@@ -1880,6 +1885,12 @@ def _inference_worker() -> None:
     geofence.load()
     gf_enabled = bool(cfg.get("geofence", {}).get("enabled"))
     gf_eval_on_track = cfg.get("geofence", {}).get("eval_on", "detect") == "track"
+    behaviour = BehaviourEngine(cfg)
+    _behaviour = behaviour
+    follow_sev = str(((cfg.get("behaviour", {}) or {}).get("following", {}) or {})
+                     .get("severity", "Medium"))
+    if follow_sev not in _SEVERITY_RANK:
+        follow_sev = "Medium"
     snapshots = SnapshotWriter(cfg)
     _snapshots = snapshots
     _harvester = Harvester(cfg) if learn_cfg.get("enabled") else None
@@ -1999,6 +2010,7 @@ def _inference_worker() -> None:
             _stats["frames_inferred"] = ds.frames_inferred
             _stats["frames_gated"] = ds.frames_gated
             _stats["frames_rate_skipped"] = ds.frames_rate_skipped
+            _stats["frames_duplicate"] = ds.frames_duplicate
             _stats["detector_passes"] = ds.detector_passes
             logger.info(
                 "PIPE  %d cams | mux %.1f tps | worker %.0f fps (%.1f bps) | "
@@ -2051,6 +2063,13 @@ def _inference_worker() -> None:
                 _geofence_dwelling = geofence.dwelling()
             if sr.inferred:
                 snapshots.prune(sr.cam_id, live_ids)
+            # Behaviour rules read tracks, so only on real detection passes: a
+            # carried-forward frame's boxes are extrapolated, and measuring
+            # speed on them would make everyone look perfectly smooth.
+            new_behaviours = []
+            if sr.inferred and behaviour.enabled:
+                new_behaviours = behaviour.evaluate(sr)
+                behaviour.prune(sr.cam_id, live_ids)
             zones = geofence.active_zones(sr.cam_id)
             _geofence_active[sr.cam_id] = zones
             _geofence_fences[sr.cam_id] = geofence.public_for(sr.cam_id)
@@ -2080,6 +2099,7 @@ def _inference_worker() -> None:
                      f"P:{sr.person_count} V:{sr.vehicle_count}  [{tag}]")
             _draw_label(frame_out, label, (8, 24), 0.55, colour)
             _draw_fences(frame_out, _geofence_fences.get(sr.cam_id, []), zones)
+            _draw_behaviour(frame_out, sr.detections, behaviour.overlay(sr.cam_id))
             if latency_ms:
                 late = latency_ms >= 1500
                 # Show the rung alongside the delay, so an operator watching a
@@ -2116,18 +2136,21 @@ def _inference_worker() -> None:
             #    in the breach record, so the file is tamper-evident. ──────────
             for b in new_breaches:
                 loiter = b.event == "loiter"
-                reason = "loiter" if loiter else "breach"
+                follow = b.event == "close_following"
+                reason = "loiter" if loiter else "following" if follow else "breach"
                 snap = None
                 if snapshots.should_capture(sr.cam_id, b.track_id, reason):
                     snap = snapshots.capture(
-                        sr.cam_id, frame_out, sr.frame, "breach",
+                        sr.cam_id, frame_out, sr.frame, reason,
                         {"detail": b.fence.label or b.fence.id, "track_id": b.track_id})
-                # Severity now comes from the fence. A perimeter wire and a
-                # counting line across an approach road are not the same alarm,
-                # and one flat Critical for both is how an operator learns to
-                # ignore it.
-                sev = b.fence.severity
-                bev = {"cam_id": sr.cam_id, "type": reason,
+                # Severity comes from the fence for a breach or loiter: a
+                # perimeter wire and a counting line across an approach road are
+                # not the same alarm, and one flat Critical for both is how an
+                # operator learns to ignore it. A close-following alert reports
+                # a pattern, not a verdict, so it has its own (lower) setting.
+                sev = follow_sev if follow else b.fence.severity
+                bev = {"cam_id": sr.cam_id,
+                       "type": "close_following" if follow else reason,
                        "fence_id": b.fence.id, "fence_label": b.fence.label,
                        "fence_kind": b.fence.kind, "track_id": b.track_id,
                        "class_name": b.class_name, "direction": b.direction,
@@ -2138,10 +2161,14 @@ def _inference_worker() -> None:
                        "sha256": (snap or {}).get("sha256")}
                 if loiter:
                     bev["elapsed_s"] = b.elapsed_s
+                if follow:
+                    bev["gap_s"] = b.elapsed_s
+                    bev["leader_track"] = b.leader_track
                 bh = evidence.append(bev)
                 store.log(sr.cam_id, sev, ra.score,
                           sr.person_count, sr.vehicle_count, bev, bh,
-                          category="loiter" if loiter else "intrusion")
+                          category=("loiter" if loiter else
+                                    "following" if follow else "intrusion"))
                 if snap is not None:
                     snap["ev_hash"] = bh
                     snapshots.record(snap)
@@ -2149,11 +2176,41 @@ def _inference_worker() -> None:
                     logger.warning("CAM-%02d LOITERING  fence=%s  track=%d  %.0fs  hash=%s…",
                                    sr.cam_id, b.fence.label or b.fence.id,
                                    b.track_id, b.elapsed_s, bh[:12])
+                elif follow:
+                    logger.warning("CAM-%02d CLOSE-FOLLOWING  fence=%s  track=%d behind %d  "
+                                   "(%.1fs)  hash=%s…",
+                                   sr.cam_id, b.fence.label or b.fence.id,
+                                   b.track_id, b.leader_track, b.elapsed_s, bh[:12])
                 else:
                     logger.warning("CAM-%02d BREACH  fence=%s  track=%d  %s %s hash=%s…",
                                    sr.cam_id, b.fence.label or b.fence.id,
                                    b.track_id, b.fence.kind,
                                    b.fence.label_direction(b.direction), bh[:12])
+
+            # ── Behaviour events (running, group) → the same evidence path as a
+            #    breach: a snapshot of the exact moment, a hash-chained record,
+            #    and a row in the event store for the alert sinks. They never
+            #    touch the camera's risk level: how someone moves is not enough
+            #    to call a person a Critical threat. ──────────────────────────
+            for be in new_behaviours:
+                snap = None
+                if snapshots.should_capture(sr.cam_id, be.key, be.kind):
+                    snap = snapshots.capture(
+                        sr.cam_id, frame_out, sr.frame, be.kind,
+                        {"detail": be.detail, "track_id": be.key})
+                bev = {"cam_id": sr.cam_id, "type": be.kind, **be.details,
+                       "level": be.severity,
+                       "evidence_file": (snap or {}).get("file"),
+                       "sha256": (snap or {}).get("sha256")}
+                bh = evidence.append(bev)
+                store.log(sr.cam_id, be.severity, ra.score,
+                          sr.person_count, sr.vehicle_count, bev, bh,
+                          category=be.kind)
+                if snap is not None:
+                    snap["ev_hash"] = bh
+                    snapshots.record(snap)
+                logger.warning("CAM-%02d %s  %s  hash=%s…",
+                               sr.cam_id, be.kind.upper(), be.detail, bh[:12])
 
             # ── Malicious posture (crouch / lying) → snapshot + evidence at
             #    "Posture" severity. Does NOT force Critical unless
@@ -2337,6 +2394,34 @@ def _draw_label(img, text: str, org, scale: float, colour) -> None:
                 (0, 0, 0), 3, cv2.LINE_AA)
     cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale,
                 colour, 1, cv2.LINE_AA)
+
+
+def _draw_behaviour(img, detections, ov: dict) -> None:
+    """Mark what the behaviour rules are flagging right now: RUNNING above a
+    runner, and a box around each confirmed group. Drawn on the carried frames
+    too — track ids survive the carry-forward, so the marks follow the people."""
+    if not ov["running"] and not ov["groups"]:
+        return
+    by_id = {d.track_id: d for d in detections if d.track_id >= 0}
+    for tid in ov["running"]:
+        d = by_id.get(tid)
+        if d is None:
+            continue
+        x1, y1 = int(d.bbox[0]), int(d.bbox[1])
+        _draw_label(img, "RUNNING", (x1, max(14, y1 - 6)), 0.5, (0, 165, 255))
+    for g in ov["groups"]:
+        boxes = [by_id[t].bbox for t in g["members"] if t in by_id]
+        if not boxes:
+            continue
+        x1 = int(min(b[0] for b in boxes)) - 6
+        y1 = int(min(b[1] for b in boxes)) - 6
+        x2 = int(max(b[2] for b in boxes)) + 6
+        y2 = int(max(b[3] for b in boxes)) + 6
+        cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 255), 2)
+        # Under the box, not above it: the mid-frame alert banners (weapon,
+        # watchlist) sit exactly where people stand and would hide the label.
+        _draw_label(img, f"GROUP {len(g['members'])}",
+                    (max(4, x1), min(img.shape[0] - 6, y2 + 18)), 0.5, (255, 0, 255))
 
 
 def _draw_banner(img, text: str, band: tuple[float, float] = (0.42, 0.58)) -> None:

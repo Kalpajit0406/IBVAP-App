@@ -29,6 +29,7 @@ import json
 import logging
 import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -42,6 +43,7 @@ _SEVERITIES = ("Info", "Low", "Medium", "High", "Critical")
 _INBOUND = {"", "a2b", "b2a"}
 _HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _MAX_LOITER_S = 86400.0          # a day; longer is a typo, not a policy
+_MAX_FOLLOW_S = 600.0            # ten minutes between two crossings is not "following"
 
 
 # ── geometry helpers (all coordinates normalised 0..1) ───────────────────────
@@ -135,6 +137,14 @@ class Fence:
     # person who drew the line says it is — honest, and the only thing that
     # makes a count meaningful in a report.
     inbound: str = ""                           # "" | "a2b" | "b2a"
+    # Lines only. Raise a `close_following` alert when a second target of the
+    # same kind crosses this line the same way within this many seconds of
+    # another — the vision-only form of tailgating. 0 = off. Vision cannot see
+    # whether the first crosser was authorised, so this reports the *pattern*
+    # (two crossings close together), not a verdict; at a gate where people
+    # legitimately walk through in twos it will fire, which is why it is off
+    # until someone turns it on for a specific fence.
+    follow_window_s: float = 0.0
 
     def wants(self, det) -> bool:
         if "any" in self.targets:
@@ -173,7 +183,7 @@ class Fence:
                 "targets": sorted(self.targets), "enabled": self.enabled,
                 "severity": self.severity, "loiter_after_s": self.loiter_after_s,
                 "armed_from": self.armed_from, "armed_to": self.armed_to,
-                "inbound": self.inbound}
+                "inbound": self.inbound, "follow_window_s": self.follow_window_s}
 
 
 @dataclass
@@ -186,8 +196,9 @@ class Breach:
     is_vehicle: bool
     ground_point: tuple[float, float]           # normalised
     direction: Optional[str]                    # set for line crossings
-    event: str = "breach"                       # "breach" | "loiter"
-    elapsed_s: float = 0.0                      # dwell time, for a loiter event
+    event: str = "breach"                       # "breach" | "loiter" | "close_following"
+    elapsed_s: float = 0.0                      # dwell time (loiter) / gap to the leader (close_following)
+    leader_track: int = -1                      # close_following: the track that crossed just before
 
 
 def _synth_id(cam_id: int, pts: list[tuple[float, float]]) -> str:
@@ -217,6 +228,7 @@ def _parse_fence(r: dict) -> Fence:
         armed_from=str(r.get("armed_from") or ""),
         armed_to=str(r.get("armed_to") or ""),
         inbound=str(r.get("inbound") or ""),
+        follow_window_s=float(r.get("follow_window_s") or 0.0),
     )
 
 
@@ -250,6 +262,9 @@ class GeoFenceEngine:
         self._seen: dict[tuple[int, int], int] = {}         # track maturity
         # (cam, fence_id, direction) -> count, since the last daily rollover
         self._crossings: dict[tuple[int, str, str], int] = {}
+        # (cam, fence_id) -> recent crossings (t, track, is_person, direction),
+        # for close-following detection. Bounded: only the last few matter.
+        self._recent_cross: dict[tuple[int, str], deque] = {}
         self._counts_day = time.strftime("%Y-%m-%d")
 
     @property
@@ -284,6 +299,7 @@ class GeoFenceEngine:
                 continue
             by_cam.setdefault(f.cam_id, []).append(f)
         self._by_cam = by_cam
+        self._recent_cross = {}          # a redrawn fence starts with no history
         logger.info("fence set: %d fence(s) across %d camera(s)",
                     self.count, len(by_cam))
 
@@ -351,6 +367,12 @@ class GeoFenceEngine:
         inbound = r.get("inbound")
         if inbound is not None and inbound not in _INBOUND:
             errs.append(f"{p}: inbound must be one of {sorted(_INBOUND)}")
+        follow = r.get("follow_window_s")
+        if follow is not None:
+            if (isinstance(follow, bool) or not isinstance(follow, (int, float))
+                    or not 0.0 <= float(follow) <= _MAX_FOLLOW_S):
+                errs.append(f"{p}: follow_window_s must be a number of seconds "
+                            f"between 0 and {int(_MAX_FOLLOW_S)}")
         return errs
 
     # ── query ──────────────────────────────────────────────────────────────
@@ -457,11 +479,39 @@ class GeoFenceEngine:
                             breaches.append(Breach(
                                 cam, f, tid, d.class_name,
                                 d.is_person, d.is_vehicle, g, dirn))
+                            if f.follow_window_s > 0:
+                                lead = self._leader(cam, f, tid, d.is_person,
+                                                    dirn, now)
+                                if lead is not None:
+                                    breaches.append(Breach(
+                                        cam, f, tid, d.class_name,
+                                        d.is_person, d.is_vehicle, g, dirn,
+                                        event="close_following",
+                                        elapsed_s=round(now - lead[0], 2),
+                                        leader_track=lead[1]))
+                                self._recent_cross.setdefault(
+                                    (cam, f.id), deque(maxlen=16)).append(
+                                        (now, tid, d.is_person, dirn))
                         break                               # one breach per fence per pass
 
             self._prev_ground[(cam, tid)] = g
 
         return breaches
+
+    def _leader(self, cam: int, f: Fence, tid: int, is_person: bool,
+                dirn: str, now: float):
+        """The most recent crossing that makes this one 'close following', or
+        None. It must be a DIFFERENT track (one person crossing back and forth
+        is not following themselves), the same kind of target (a person walking
+        through behind a truck is not tailgating), and the same direction (two
+        people passing each other in opposite directions are not following)."""
+        for e in reversed(self._recent_cross.get((cam, f.id), ())):
+            t0, ltid, lperson, ldir = e
+            if now - t0 > f.follow_window_s:
+                break                                       # older entries are older still
+            if ltid != tid and lperson == is_person and ldir == dirn:
+                return e
+        return None
 
     # ── crossing tallies ────────────────────────────────────────────────────
     def _roll_counts(self, now: float) -> None:

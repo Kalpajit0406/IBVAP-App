@@ -16,6 +16,7 @@ class FencesSection extends StatefulWidget {
 class _FencesSectionState extends State<FencesSection> {
   final _label = TextEditingController();
   final _loiter = TextEditingController();
+  final _follow = TextEditingController();
   final _from = TextEditingController();
   final _to = TextEditingController();
   int? _cam;
@@ -26,6 +27,7 @@ class _FencesSectionState extends State<FencesSection> {
   void dispose() {
     _label.dispose();
     _loiter.dispose();
+    _follow.dispose();
     _from.dispose();
     _to.dispose();
     super.dispose();
@@ -56,6 +58,7 @@ class _FencesSectionState extends State<FencesSection> {
           _rev = ed.revision;
           _label.text = ed.label;
           _loiter.text = ed.loiterText;
+          _follow.text = ed.followText;
           _from.text = ed.armedFrom;
           _to.text = ed.armedTo;
         }
@@ -162,6 +165,27 @@ class _FencesSectionState extends State<FencesSection> {
                         value: 'b2a', child: Text('Inbound = B → A')),
                   ],
                   onChanged: (v) => ed.setInbound(v ?? ''),
+                ),
+                const SizedBox(height: 6),
+                TextField(
+                  controller: _follow,
+                  style: const TextStyle(fontSize: 12, color: IbvapColors.text),
+                  keyboardType: TextInputType.number,
+                  inputFormatters: [
+                    FilteringTextInputFormatter.allow(RegExp(r'[0-9.]')),
+                  ],
+                  decoration: const InputDecoration(
+                      labelText: 'Flag close-following within (seconds)',
+                      hintText: 'blank = off'),
+                  onChanged: ed.setFollowText,
+                ),
+                const Padding(
+                  padding: EdgeInsets.only(top: 3),
+                  child: Text(
+                      'Flags a second crosser right behind the first. It reports '
+                      'a pattern, not a verdict — expect it to fire where people '
+                      'legitimately pass in pairs.',
+                      style: TextStyle(color: IbvapColors.muted, fontSize: 9)),
                 ),
               ],
               const SizedBox(height: 6),
@@ -368,6 +392,10 @@ class _FencesSectionState extends State<FencesSection> {
     }
     if (f.inbound == 'a2b') parts.add('inbound A→B');
     if (f.inbound == 'b2a') parts.add('inbound B→A');
+    final follow = f.followWindowS as double;
+    if (follow > 0) {
+      parts.add('follow ${follow == follow.roundToDouble() ? follow.round() : follow}s');
+    }
     return parts.join(' · ');
   }
 

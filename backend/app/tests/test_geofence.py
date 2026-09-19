@@ -317,6 +317,108 @@ def _():
     assert old.severity == "Critical" and old.loiter_after_s == 0.0
 
 
+# ── close-following crossing (the vision-only form of tailgating) ───────────
+
+def _follow_events(eng, plan, cam=0):
+    """plan: [(track, gx, cls), ...] applied one pass at a time; returns the
+    close_following breaches that fired."""
+    out = []
+    for step in plan:
+        dets = [_det_at(tid, gx, 0.5, cls=cls) for tid, gx, cls in step]
+        out += [b for b in eng.evaluate(_sr(cam, dets)) if b.event == "close_following"]
+    return out
+
+
+@case("a second person crossing right behind the first is close-following")
+def _():
+    eng = _engine([dict(VLINE, follow_window_s=5.0)], cooldown=1)
+    plan = [[(1, 0.2, "person"), (2, 0.2, "person")],
+            [(1, 0.8, "person"), (2, 0.2, "person")],       # 1 crosses
+            [(1, 0.8, "person"), (2, 0.8, "person")]]       # 2 crosses, right after
+    ev = _follow_events(eng, plan)
+    assert len(ev) == 1
+    assert ev[0].track_id == 2 and ev[0].leader_track == 1
+    assert 0.0 <= ev[0].elapsed_s < 5.0
+    assert ev[0].event == "close_following" and ev[0].direction == "a2b"
+
+
+@case("the first crosser is not flagged, and the ordinary crossings still fire")
+def _():
+    eng = _engine([dict(VLINE, follow_window_s=5.0)], cooldown=1)
+    crossings = []
+    for step in [[(1, 0.2), (2, 0.2)], [(1, 0.8), (2, 0.2)], [(1, 0.8), (2, 0.8)]]:
+        crossings += eng.evaluate(_sr(0, [_det_at(t, x, 0.5) for t, x in step]))
+    kinds = [(b.track_id, b.event) for b in crossings]
+    assert (1, "breach") in kinds and (2, "breach") in kinds
+    assert (1, "close_following") not in kinds
+    assert (2, "close_following") in kinds
+
+
+@case("close-following is off unless the fence sets a window")
+def _():
+    eng = _engine([VLINE], cooldown=1)
+    plan = [[(1, 0.2, "person"), (2, 0.2, "person")],
+            [(1, 0.8, "person"), (2, 0.2, "person")],
+            [(1, 0.8, "person"), (2, 0.8, "person")]]
+    assert _follow_events(eng, plan) == []
+
+
+@case("two crossings further apart than the window are not following")
+def _():
+    import time as _t
+    eng = _engine([dict(VLINE, follow_window_s=0.05)], cooldown=1)
+    plan = [[(1, 0.2, "person"), (2, 0.2, "person")],
+            [(1, 0.8, "person"), (2, 0.2, "person")]]
+    assert _follow_events(eng, plan) == []
+    _t.sleep(0.12)
+    assert _follow_events(eng, [[(1, 0.8, "person"), (2, 0.8, "person")]]) == []
+
+
+@case("the same person crossing back and forth is not following themselves")
+def _():
+    eng = _engine([dict(VLINE, follow_window_s=5.0)], cooldown=1)
+    plan = [[(1, 0.2, "person")], [(1, 0.8, "person")],
+            [(1, 0.2, "person")], [(1, 0.8, "person")]]
+    assert _follow_events(eng, plan) == []
+
+
+@case("opposite directions are two people passing, not one following another")
+def _():
+    eng = _engine([dict(VLINE, follow_window_s=5.0)], cooldown=1)
+    plan = [[(1, 0.2, "person"), (2, 0.8, "person")],
+            [(1, 0.8, "person"), (2, 0.8, "person")],       # 1 crosses left->right
+            [(1, 0.8, "person"), (2, 0.2, "person")]]       # 2 crosses right->left
+    assert _follow_events(eng, plan) == []
+
+
+@case("a person crossing behind a vehicle is not tailgating")
+def _():
+    eng = _engine([dict(VLINE, follow_window_s=5.0)], cooldown=1)
+    plan = [[(1, 0.2, "truck"), (2, 0.2, "person")],
+            [(1, 0.8, "truck"), (2, 0.2, "person")],
+            [(1, 0.8, "truck"), (2, 0.8, "person")]]
+    assert _follow_events(eng, plan) == []
+    eng = _engine([dict(VLINE, follow_window_s=5.0)], cooldown=1)
+    plan = [[(1, 0.2, "truck"), (2, 0.2, "truck")],
+            [(1, 0.8, "truck"), (2, 0.2, "truck")],
+            [(1, 0.8, "truck"), (2, 0.8, "truck")]]
+    assert len(_follow_events(eng, plan)) == 1, "a vehicle following a vehicle should count"
+
+
+@case("follow_window_s round-trips and is validated")
+def _():
+    from ibvap.geofence import _parse_fence
+    f = _parse_fence(dict(VLINE, follow_window_s=2.5))
+    assert f.follow_window_s == 2.5 and f.to_public()["follow_window_s"] == 2.5
+    assert _parse_fence(VLINE).follow_window_s == 0.0          # older fences load
+    assert _parse_fence(dict(VLINE, follow_window_s=None)).follow_window_s == 0.0
+    assert GeoFenceEngine.validate([dict(VLINE, follow_window_s=2.5)]) == []
+    assert GeoFenceEngine.validate([dict(VLINE, follow_window_s=None)]) == []
+    for bad in (-1, 10 ** 6, "3", True, [2]):
+        assert any("follow_window_s" in e for e in
+                   GeoFenceEngine.validate([dict(VLINE, follow_window_s=bad)])), bad
+
+
 def _errs(**over) -> list[str]:
     return GeoFenceEngine.validate([dict(BOX, **over)])
 
