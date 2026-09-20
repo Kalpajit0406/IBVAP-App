@@ -9,6 +9,11 @@ SIH 2026, PS 26187 · Ministry of Home Affairs / Sashastra Seema Bal (SSB) · Th
 
 Software-only AI analytics layer on top of existing CCTV infrastructure. No proprietary FRS/ANPR hardware. 1–2 week build window, team of 6 with coursework-level CV/ML experience.
 
+> **Master briefing:** [`../../CLAUDE.md`](../../CLAUDE.md) (the repo root) holds the goal, the standing rules, the status
+> against the problem statement, what is measured versus assumed, and the prioritised list of what is left. **Read it first.**
+> This file is the backend deep-dive: throughput engineering, per-feature internals and benchmark tables. Where the two
+> disagree, the code wins — then fix both.
+
 ---
 
 ## Commands
@@ -68,7 +73,20 @@ python tests/test_anpr_events.py   # vehicle arrival/idle state machine, AnprRes
 python tests/test_vehicle_type.py  # vehicle-type classifier's coarse-COCO fallback path
 python tests/test_learn.py         # harvest pseudo-label gate: track-stable, rate limit, label format
 python tests/test_calibration.py   # per-camera calibration: EMA bounds, suppression-cell promotion
+python tests/test_face.py          # face engine: gallery match, thresholds, self-disable paths
+python tests/test_face_events.py   # person-arrival burst, vote, always-capture writer (22 cases)
+python tests/test_ws_capture.py    # phone frame decode, latency + clock sync, ack credit (8)
+python tests/test_uplink_tuner.py  # the adaptive rung ladder: demote/panic/promote, global budget (15)
+python tests/test_event_store.py   # schema v2, ULIDs (monotonic), cursor, ack, migration (13)
+python tests/test_alert_forward.py # forwarder: per-sink cursors, ordering, backoff, retention (13)
+python tests/test_behaviour.py     # running + group rules in body-heights (22)
+python tests/test_detector_schedule.py # which frames the detector spends a pass on; slow-source rule (9)
+python tests/test_youtube_capture.py   # URL detection, format pick, expiry, _Pacer, no network (29)
+python tests/test_security.py      # write-access control: loopback / token
 ```
+
+`pytest` is not installed in the system Python; every module runs itself. To run them all:
+`for f in tests/test_*.py; do python "$f" | tail -1; done` — **320 cases across 23 modules, 0 failures** (2026-09-21).
 
 - **Monitor** → `http://localhost:8090/monitor` (plain HTTP — no certificate warning)
 - **Phone on the same WiFi** → `https://<LAN-IP>:8443/camera/0` (`getUserMedia`
@@ -146,6 +164,12 @@ what the phone *actually* granted from `track.getSettings()`, sends that as a
 JSON `hello` over a WebSocket, then streams frames on the same socket.
 `ibvap/ws_capture.py` decodes each frame and **normalises it to 1280×720
 server-side** (phones rarely honour the request).
+
+> **Superseded in part (Sep 2026).** The `ws.bufferedAmount` skip described next was not enough on a laptop-hotspot Wi-Fi
+> (10–15 s latency; `bufferedAmount` reads ~0 while frames sit in kernel/driver queues). It now sits under a
+> **server-acked credit loop** (`ingest.max_in_flight`), a **server-driven adaptive ladder** (`ibvap/uplink_tuner.py`, `tune`
+> messages) and **stale-frame dropping before decode** (`ingest.max_frame_age_ms`). See the root `CLAUDE.md` §6.3, including why the
+> ladder holds 8 fps (ByteTrack loses fast movers below ~6 fps).
 
 **Latency control — the phone is the bottleneck, not the pipeline.** A mobile
 uplink is ~1–5 Mbps; 720p JPEG at 24 fps is ~10 Mbps, so with a naive sender
@@ -238,6 +262,9 @@ backpressure the camera sockets:
 The `PIPE` log line reports both: `mux <tps>` (should stay 24) and
 `worker <fps> (<bps>)` with a `dropped` counter.
 
+A third long-lived thread, the **`AlertForwarder`**, drains `events.db` to the configured sinks on its own SQLite connection
+(see "Events, alert egress and C2" below) — it must never run on either of these two.
+
 **Everything in `process_batch` is batched across cameras.** `_infer_batch`
 runs the detector once for the whole batch (`_track` then does per-camera
 ByteTrack bookkeeping only), then `_pose_pass` and `_anpr_pass` each make **one**
@@ -296,8 +323,20 @@ config.yaml           # streams, model, throughput, risk, pose/weapon/geofence/l
 
 ibvap/                # the pipeline package (was src/; import as `from ibvap.X import …`)
 ├── detector.py       # Detector: batched YOLO26n + per-camera ByteTrack + carry-forward + pose/anpr/weapon passes
-├── rtsp_capture.py   # RtspCapture: CCTV/RTSP/NVR/webcam/file puller — decode thread, TCP, reconnect + stall watchdog
-├── ws_capture.py     # WebSocketCapture: browser/replay frames; generation-guarded reconnect
+├── rtsp_capture.py   # RtspCapture: CCTV/RTSP/NVR/webcam/file puller — decode thread, TCP, reconnect + stall watchdog; _Pacer; _resolve_source() hook
+├── youtube_capture.py# YouTubeCapture(RtspCapture): yt-dlp resolve → media URL, format pick, expiry re-resolve, VOD loop / live
+├── ws_capture.py     # WebSocketCapture: browser/replay frames; generation-guarded reconnect; latency + clock sync; ack credit
+├── uplink_tuner.py   # UplinkTuner: server-chosen resolution/fps/quality rung per phone from measured latency
+├── behaviour.py      # BehaviourEngine: running + group rules on tracks, in body-heights (heuristics, Medium severity)
+├── face.py           # FaceEngine: RetinaFace + ArcFace against the watchlist gallery (InsightFace buffalo_l)
+├── face_events.py    # PersonArrivalTracker (burst + vote) and FaceResultWriter (always-capture output folder)
+├── anpr_events.py    # VehicleArrivalTracker (arrival/idle) and AnprResultWriter
+├── vehicle_type.py   # 8-class vehicle-type classifier with a coarse-COCO fallback
+├── event_store.py    # EventStore: SQLite events, schema v2 (ULID ids, severity/category), cursor reads, persisted ack
+├── alert_forward.py  # AlertForwarder daemon: drains events.db to the sinks, per-sink cursors, backoff, retention
+├── sinks.py          # webhook / syslog-CEF / mqtt sinks + event_payload() (the `ibvap.event/2` wire format)
+├── security.py       # write-access control: loopback or X-IBVAP-Token
+├── imaging.py        # shared JPEG-encode / filename-slug helpers for every evidence writer
 ├── screen_capture.py # ScreenCapture: mss screen grab with the StreamCapture interface (server.py --mode screen)
 ├── motion_gate.py    # MotionGate: cheap frame-difference pre-filter in front of the GPU
 ├── posture.py        # PoseEstimator (yolo26n-pose on person crops) + PoseClassifier geometry rules
@@ -308,8 +347,7 @@ ibvap/                # the pipeline package (was src/; import as `from ibvap.X 
 ├── risk_engine.py    # RiskEngine: zone × time_of_day × behaviour → 0–100 score (+ weapon / fence overrides)
 ├── learn.py          # Harvester: auto-label stable/confident detections → data/learning/ pool (continuous learning)
 ├── calibration.py    # Calibrator: per-camera live confidence-floor + false-positive-region tuning, no training
-├── evidence.py       # EvidenceChain: append-only SHA-256 hash-chain JSONL
-├── event_store.py    # EventStore: SQLite store-and-forward (survives network outage)
+├── evidence.py       # EvidenceChain: append-only SHA-256 hash-chain JSONL (tamper-evident; not anchored anywhere yet)
 └── display.py        # GridDisplay: OpenCV multi-stream grid with risk overlay (used by main.py)
 
 scripts/              # operational CLIs
@@ -319,6 +357,7 @@ scripts/              # operational CLIs
 ├── loadtest_mobile.py# 8-device load test: phone-like WS clients, measures fps + GPU
 ├── benchmark.py      # Four-way comparison of the throughput optimisations
 ├── diagnose.py       # Checks each pipeline stage end to end (server must be up)
+├── alert_sink.py     # Demo C2 receiver on :9000 — proves alerts leave the machine (--fail shows the queue build/drain)
 └── tunnel.py         # Off-LAN phones: ngrok / cloudflared quick tunnel, or --named for your own domain
 
 training/             # model training + dataset prep  (weights → models/, datasets → E:/Projects)
@@ -492,11 +531,12 @@ triggered. `tests/test_posture.py` (12 cases) checks the fire cases
 (chest / low-ready / angled) and the reject cases (belt-clasp, folded arms,
 one-hand, wide hands, surrender).
 
-**A detected AIM forces the risk level to Critical** (`risk_engine.assess`:
-`level = "Critical"`, `score = max(score, 92)`, `RiskAssessment.weapon = True`).
-Previously a confirmed aim scored ~67 in daytime — under the 70 threshold — so
-it only went Critical at night. The worker also paints a full-width red banner
-across that tile (text depends on the fusion tier — see Weapon detection).
+**AIM alone raises High, not Critical** (`risk.posture_aim_level: "High"`; `risk_engine.assess` gives
+`level = "High"`, `score = max(score, min(threshold_high + 15, 69))`, `weapon = False`). It is a 2-D skeleton guess with
+no view of any weapon — two hands on a phone can trip it — and the standing rule is that nothing short of a confirmed
+weapon, a watchlist face match or a fence breach is Critical. Setting `posture_aim_level: "Critical"` restores the older
+behaviour (`score = max(score, 92)`, tier `posture`, banner `WEAPON (posture)`) but should not be done without the user.
+A **confirmed gun** (alone or fused with AIM) is always Critical — see Weapon detection.
 
 Known limits of a 2D-skeleton approach: a one-handed pistol grip won't fire
 (needs two hands), and a person holding a clipboard/phone two-handed at chest
@@ -523,9 +563,9 @@ same idea as `aim_hold_frames`). Unconfirmed hits are drawn faint (`gun?`) and
 never alert.
 
 **Fusion in `risk_engine.assess`** (`RiskAssessment` gains `armed`,
-`weapon_tier`), on the same track: AIM only → score ≥ 92, banner
-`WEAPON (posture)`; confirmed gun only → ≥ 94, `GUN DETECTED`; AIM **and**
-confirmed gun → **99, `ARMED THREAT`**. Each first-time `confirmed` gun writes a
+`weapon_tier`), on the same track: AIM only → **High** by default (Critical ≥ 92 with banner `WEAPON (posture)` only if
+`risk.posture_aim_level: "Critical"`); confirmed gun only → Critical, ≥ 94, `GUN DETECTED`; AIM **and**
+confirmed gun → Critical, **99, `ARMED THREAT`**. A watchlist face match is Critical, ≥ 96. Each first-time `confirmed` gun writes a
 `{"type":"weapon"}` row to the hash chain (same override shape as a fence
 breach); crops go to `Harvester.submit_weapon` for operator review.
 
@@ -590,10 +630,16 @@ The operator draws **polygon zones** and **directional fence lines** (2+ points,
 each segment a tripwire) on each camera's own view in the dashboard FENCES
 panel. A tracked person/vehicle whose
 **ground point** (bbox bottom-centre) enters a zone, or whose path crosses a
-line in the flagged direction, forces that camera to **CRITICAL** —
-`ra.level, ra.score = "Critical", max(ra.score, 90)` in `server._inference_worker`,
-the same override shape as the weapon rule — and writes a `{"type":"breach"}`
-record to the hash chain plus a `level="Breach"` row in `data/events.db`.
+line in the flagged direction, is a breach. The camera's level then follows the
+**worst breached fence's own `severity`** (`server._inference_worker`): a Critical fence — the
+default — sets `ra.level, ra.score = "Critical", max(ra.score, 90)`, the same override shape as the
+weapon rule; a High fence sets High (≥ 70); a lower severity (a counting line is not a perimeter
+wire) leaves the level alone. Every breach writes a `{"type":"breach"}` record to the hash chain
+plus a `level="Breach"` row (severity per the fence, category `intrusion`) in `data/events.db`.
+Per-fence extras added since: `loiter_after_s` (dwell → one `loiter` event with the elapsed time),
+`armed_from`/`armed_to` (local-time arming window, crosses midnight), `inbound` label, per-direction
+**crossing counts** with daily rollover, `follow_window_s` (close-following crossing), and a
+**maturity gate** (`geofence.min_track_passes`, 3) so a one-frame spurious detection cannot breach.
 
 - **No geo-projection.** IBVAP has zero camera calibration (lat/lon, height,
   bearing, FOV, homography — none anywhere), so fences are **normalised 0..1
@@ -606,7 +652,7 @@ record to the hash chain plus a `level="Breach"` row in `data/events.db`.
   exit is debounced by `geofence.exit_passes`, tripwire re-fire by
   `geofence.reentry_cooldown_passes`. Per-track state keyed `(cam_id, track_id)`;
   `prune()` drops stale ids like `PoseClassifier.flush_missing`.
-- Pure geometry, no GPU/model/OpenCV — `tests/test_geofence.py` (16 cases).
+- Pure geometry, no GPU/model/OpenCV — `tests/test_geofence.py` (39 cases).
 - Overlay is burned into the mosaic (`server._draw_fences`) **and** drawn as an
   SVG layer in `monitor.html`; the click→tile→cam_id math undoes the mosaic's
   `object-fit: contain` using `/status.mosaic.tiles` (an explicit `{cam_id,x,y,w,h}`
@@ -618,8 +664,10 @@ record to the hash chain plus a `level="Breach"` row in `data/events.db`.
 
 ## Intrusion snapshots (`ibvap/snapshots.py`)
 
-On a **fence breach**, a **confirmed weapon**, or a **malicious posture**
-(crouching / lying — `snapshots.malicious_postures`), `_inference_worker` writes
+On a **fence breach**, a **confirmed weapon**, a **malicious posture**
+(crouching / lying — `snapshots.malicious_postures`), or — since Sep 2026 — a **loiter**,
+**running**, **group** or **close-following** event (`snapshots.on_loiter/on_running/on_group/on_following`),
+`_inference_worker` writes
 an annotated JPEG *and* a raw JPEG of that frame under
 `data/snapshots/<cam_id>/` (folder `0` for camera 0, `1` for camera 1 …, created
 the first time each camera produces a frame). Each event appends one line to that
@@ -681,6 +729,43 @@ partly real. **No weights ever change on their own.**
 
 ---
 
+## Events, alert egress and C2 (`ibvap/event_store.py`, `alert_forward.py`, `sinks.py`)
+
+Added Sep 2026 after an audit found that nothing could leave the machine: a store-and-forward queue existed (`synced`
+column, `unsynced()`, `mark_synced()`) and nothing ever called it. Full description in the root `CLAUDE.md` §6.7; the
+code-level facts a maintainer needs:
+
+* **Schema v2.** Every event has a monotonic **ULID** `event_id` (also the feed cursor), `ts_utc`, `site_id`/`post_name`
+  (`config.yaml site:`), camera identity, **`severity`** (`Info|Low|Medium|High|Critical`) and **`category`** (`risk, intrusion,
+  loiter, crossing, running, group, following, weapon, posture, face_match, plate`) — previously one squashed `level` column.
+  `level` is still written with its legacy meaning (`Breach`/`Posture`/`Plate`). Migration is additive with a backfill.
+  `EventStore.log()` must not be handed a `ts` (only the migration does).
+* **Forwarder.** One daemon thread, its own SQLite connection, never on the inference thread. In-order, at-least-once **per
+  sink**; a failure holds that sink's cursor; each sink has its own cursor and blocked-state so a dead one cannot starve a
+  healthy one; exponential backoff with jitter. Marked synced once every *enabled* sink has it (or none is configured).
+  Delivered rows are pruned after `alerts.retention_days`; undelivered rows are never dropped unless `max_attempts` > 0.
+* **Sinks** (`sinks.py`): `webhook` (rewrites `localhost` → `127.0.0.1`: ~2 s vs 15 ms per POST on Windows), `syslog` (RFC 5424 + CEF),
+  `mqtt` (optional). All off by default. Wire format `ibvap.event/2` in `event_payload()` — add fields, never rename.
+* **Routes:** `GET /api/events` (`since_id` cursor), `GET /api/events/stream` (SSE), `POST /api/events/{id}/ack` (persisted with
+  the operator name and appended to the hash chain), `GET /api/events/export?format=csv|json`. `/status.alerts` reports per-sink
+  queue depth, last delivery and last error.
+* **Demo:** `python scripts/alert_sink.py`, then enable a webhook sink at `http://127.0.0.1:9000/alert`.
+
+## Behaviour rules (`ibvap/behaviour.py`) and face capture (`ibvap/face_events.py`)
+
+**Behaviour.** *Running* = net displacement over a 1.0 s window ≥ 2.0 **body-heights**/s for 3 consecutive detection passes
+(a step above 6 bh/s is a tracker swap and restarts history); *group* = people within 1.5 body-heights, transitively linked,
+≥ 3 for ≥ 3 s. Body-heights cancel perspective without camera calibration. Evaluated only on real detection passes
+(`sr.inferred`) — carried-forward boxes are extrapolated and would look perfectly smooth. *Close-following* lives in
+`geofence.py` (`follow_window_s` on a tripwire). All **Medium**, none can reach Critical, and **no false-alarm rate has been
+measured** — treat thresholds as starting points. Known limits: a queue at a check post trips the group rule; a group in a
+static scene takes ~5 s to confirm (the motion gate re-checks it about once a second).
+
+**Face.** Every person arrival opens a burst; readings from padded person crops feed a majority vote (`burst_n` 5, `vote_min` 3,
+`match_threshold` 0.38) before anyone is named. Separately, `capture_score_min` makes the writer **always keep the best face
+crop** — blurry, side-on, backlit, distant — under `data/face_results/<cam>/`, since it can never name anyone and so adds no
+false-match risk. A confirmed watchlist match is Critical (≥ 96). The gallery holds 3 consented teammate identities.
+
 ## Multi-stream throughput — how the pipeline stays real-time
 
 Five mechanisms, in the order a frame meets them. `scripts/benchmark.py` measures 1–4
@@ -705,6 +790,14 @@ rather than each camera's own frame counter, so all cameras come due in the
 same pass and the batch stays full. (This is velocity extrapolation, not a
 Kalman predict — fine for people at demo range; a real 24 fps Kalman step is a
 possible future refinement.)
+
+**Slow-source rule (Sep 2026, `Detector.process_batch`, `tests/test_detector_schedule.py`).** The shared 8 Hz limiter
+above aliases against a phone that delivers ~8 fps: passes alternately land on a fresh frame and on the one after next, so the
+step between processed frames alternates 1 and 2 and a runner outruns their own box width — measured live, the model found
+the runner on every frame while the tracker turned one runner into several ids. So when a camera's measured frame period is
+≥ 0.75 of the detection interval, **every fresh frame is processed** and repeats of the same array are skipped
+(`pipeline.frames_duplicate`, counted in `gpu_saving_pct`). Fast sources (25 fps CCTV) are still thinned to 8 fps, so the GPU
+budget for them is unchanged. Do not simplify this back to a fixed limiter.
 
 **3. Motion gating** (`motion_gating`, `ibvap/motion_gate.py`)
 A 160×90 greyscale frame difference (0.93 ms) decides whether a scene changed
@@ -859,7 +952,9 @@ hardware-specific): `python tools/export_engine.py` — reads `image_size` and
   a single public dataset, so misses on odd angles / small guns / low light are
   expected. Production accuracy (more data, operator-confirmed crops, a heavier
   backbone) is the roadmap item, not the capability itself.
-- Per-endpoint auth (camera intake, dashboard, tunnel link are all currently open)
+- Fuller auth: **writes are gated** (`ibvap/security.py` — loopback source or `X-IBVAP-Token`), but every GET, the MJPEG streams
+  and the phone camera intake are still open, one token has no scopes, and a tunnel link is public. Scoped/revocable clients and
+  a `require_auth_for_reads` switch are backlog item H/E in the root `CLAUDE.md`
 - **ANPR accuracy — now partially live.** `ibvap/anpr.py` has: a `fast_plate`
   OCR backend (`fast-plate-ocr`, plate-specific ONNX) with an EasyOCR fallback;
   **multi-frame positional voting** across each vehicle track; and a
